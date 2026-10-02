@@ -1,0 +1,8 @@
+{
+  "name": "MeSH-to-Wikidata Linker",
+  "description": "Streamline mapping MeSH terms to Wikidata properties with AI-driven verification, reference sourcing, and efficient batch exporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
