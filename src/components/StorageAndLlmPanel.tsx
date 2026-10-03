@@ -2,7 +2,7 @@ import React, { useRef, useState } from 'react';
 import { Download, Upload, Cpu, Database, CheckCircle2, FileText } from 'lucide-react';
 import { DatasetInfoResponse, LlmConfig } from '../types';
 import { normalizeOllamaBase } from '../lib/classifier';
-import { PropertyCheck, verifyProperties } from '../lib/wikidata';
+import { PropertyCheck } from '../lib/wikidata';
 
 interface StorageAndLlmPanelProps {
   activeSection: 'storage' | 'llm';
@@ -12,6 +12,8 @@ interface StorageAndLlmPanelProps {
   rawCsvString: string;
   config: LlmConfig;
   onConfigChange: (cfg: LlmConfig) => void;
+  propertyChecks: PropertyCheck[];
+  onVerifyProperties: () => Promise<PropertyCheck[]>;
 }
 
 export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
@@ -22,6 +24,8 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
   rawCsvString,
   config,
   onConfigChange,
+  propertyChecks,
+  onVerifyProperties,
 }) => {
   const [csvInput, setCsvInput] = useState('');
   const fileText = useRef<{ name: string; text: string } | null>(null);
@@ -30,7 +34,7 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
-  const [checks, setChecks] = useState<PropertyCheck[] | null>(null);
+  const checks = propertyChecks.length > 0 ? propertyChecks : null;
   const [testing, setTesting] = useState(false);
   const [testNotes, setTestNotes] = useState<string[]>([]);
 
@@ -70,13 +74,12 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
     setTestNotes([]);
     const notes: string[] = [];
     try {
-      const res = await verifyProperties(datasetInfo?.availableProperties ?? []);
-      setChecks(res);
+      const res = await onVerifyProperties();
       const bad = res.filter((r) => !r.ok);
       notes.push(
         bad.length === 0
           ? `All ${res.length} property IDs match their Wikidata labels.`
-          : `${bad.length} property ID(s) do not match the Wikidata label; fix them in src/data/biomedicalOntology.ts: ${bad.map((b) => b.pid).join(', ')}.`
+          : `${bad.length} property ID(s) do not match the Wikidata label and are switched off. Correct them in src/data/biomedicalOntology.ts: ${bad.map((b) => b.pid).join(', ')}.`
       );
     } catch (e) {
       notes.push(`Could not reach Wikidata: ${e instanceof Error ? e.message : String(e)}`);
@@ -331,7 +334,7 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
             02. Supported Wikidata Biomedical Properties ({datasetInfo?.availableProperties.length ?? 0})
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Candidate properties offered to the classifier. Use the check above to confirm each ID against Wikidata.
+            Candidate properties offered to the classifier. Each ID is verified against its live Wikidata label when the app starts; mismatches are switched off. For a property not listed, use "Other property ID" in the inspector.
           </p>
         </div>
         <div className="overflow-x-auto">
@@ -339,6 +342,7 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                 <th className="py-2.5 px-4">Property ID</th>
+                <th className="py-2.5 px-4">Category</th>
                 <th className="py-2.5 px-4">Label (configured)</th>
                 <th className="py-2.5 px-4">Live Wikidata check</th>
                 <th className="py-2.5 px-4">Subject Domain → Object Range</th>
@@ -358,16 +362,17 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
                       {prop.pid}
                     </a>
                   </td>
-                  <td className="py-2.5 px-4 font-medium text-slate-900">{prop.label}</td>
+                  <td className="py-2.5 px-4 text-slate-500 whitespace-nowrap">{prop.category ?? ''}{prop.generic ? ' (generic)' : ''}</td>
+                  <td className={`py-2.5 px-4 font-medium ${datasetInfo?.excludedPids.includes(prop.pid) ? 'text-slate-400 line-through' : 'text-slate-900'}`}>{prop.label}</td>
                   <td className="py-2.5 px-4 text-[11px]">
                     {(() => {
                       const c = checks?.find((x) => x.pid === prop.pid);
                       if (!c) return <span className="text-slate-400">not checked</span>;
-                      return c.ok ? <span className="text-emerald-700">● matches</span> : <span className="text-rose-700">▲ Wikidata says: {c.wikidataLabel ?? 'unknown'}</span>;
+                      return c.ok ? <span className="text-emerald-700">● matches</span> : <span className="text-rose-700">▲ switched off: Wikidata says "{c.wikidataLabel ?? 'unknown'}"</span>;
                     })()}
                   </td>
                   <td className="py-2.5 px-4 text-slate-600">
-                    {prop.domainGroups.slice(0, 2).join(', ')} → {prop.rangeGroups.slice(0, 2).join(', ')}
+                    {prop.domainGroups.length >= 12 ? 'any' : prop.domainGroups.slice(0, 2).join(', ')}{prop.domainGroups.length > 2 && prop.domainGroups.length < 12 ? ' …' : ''} → {prop.rangeGroups.length >= 12 ? 'any' : prop.rangeGroups.slice(0, 2).join(', ')}{prop.rangeGroups.length > 2 && prop.rangeGroups.length < 12 ? ' …' : ''}
                   </td>
                   <td className="py-2.5 px-4 font-mono text-[11px] text-slate-500">
                     {prop.exampleUsage}

@@ -19,6 +19,7 @@ interface RelationInspectorProps {
   onDecision: (id: string, status: 'approved' | 'rejected' | 'pending') => void;
   onPropertyChange: (id: string, pid: string) => void;
   onRefreshPubMed: (id: string) => Promise<void>;
+  onCustomProperty: (id: string, pid: string) => Promise<void>;
   canApprove: boolean;
 }
 
@@ -78,8 +79,12 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
   onDecision,
   onPropertyChange,
   onRefreshPubMed,
+  onCustomProperty,
   canApprove,
 }) => {
+  const [customPid, setCustomPid] = useState('');
+  const [customBusy, setCustomBusy] = useState(false);
+  const [customError, setCustomError] = useState<string | null>(null);
   const [refreshingPubMed, setRefreshingPubMed] = useState(false);
   const [copiedSparql, setCopiedSparql] = useState(false);
 
@@ -225,12 +230,54 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
               onChange={(e) => onPropertyChange(relation.id, e.target.value)}
               className="w-full text-xs bg-white border border-slate-300 rounded-md px-2.5 py-2 text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-blue-600"
             >
-              {availableProperties.map((prop) => (
+              {(availableProperties.some((x) => x.pid === relation.selectedProperty.pid)
+                ? availableProperties
+                : [relation.selectedProperty, ...availableProperties]
+              ).map((prop) => (
                 <option key={prop.pid} value={prop.pid}>
                   {prop.pid} — {prop.label}
                 </option>
               ))}
             </select>
+
+            <div className="mt-2 flex items-center gap-2">
+              <input
+                type="text"
+                value={customPid}
+                onChange={(e) => {
+                  setCustomPid(e.target.value);
+                  setCustomError(null);
+                }}
+                placeholder="Other property ID, e.g. P1050"
+                aria-label="Other Wikidata property ID"
+                className="flex-1 min-w-0 text-xs font-mono bg-white border border-slate-300 rounded-md px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-600"
+              />
+              <button
+                type="button"
+                disabled={customBusy || !customPid.trim()}
+                onClick={async () => {
+                  setCustomBusy(true);
+                  setCustomError(null);
+                  try {
+                    await onCustomProperty(relation.id, customPid);
+                    setCustomPid('');
+                  } catch (e) {
+                    setCustomError(e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setCustomBusy(false);
+                  }
+                }}
+                className="px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 rounded-md whitespace-nowrap cursor-pointer"
+              >
+                {customBusy ? 'Checking...' : 'Use'}
+              </button>
+            </div>
+            {customError && <p className="mt-1 text-xs text-rose-700">{customError}</p>}
+            {relation.selectedProperty.custom && (
+              <p className="mt-1 text-[11px] text-amber-800">
+                Property added by hand: the app only checked that it exists and takes item values. Make sure it means what you intend.
+              </p>
+            )}
           </div>
 
           <div className="mt-2.5">
