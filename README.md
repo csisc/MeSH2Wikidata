@@ -8,19 +8,33 @@ It runs entirely in the browser and needs no server.
 
 | Step | How | Source |
 |---|---|---|
-| MeSH descriptor ID → Wikidata item | one SPARQL query on **P486** (MeSH descriptor ID); label, description and MeSH tree numbers (**P672**) come back with it | Wikidata Query Service |
-| Existing statements | one SPARQL query for every non-deprecated statement between the two items, in both directions, any property, with its reference count and PubMed IDs; a relation that already exists *and* already cites the PubMed paper is not exported again | Wikidata Query Service |
-| Property suggestion | rule-based domain/range scorer (default), or a **local LLM through Ollama** that must pick from the candidate list or answer `NONE` | your machine |
-| Reference | PubMed search: papers indexed with both MeSH terms (with a subheading hint for the chosen property first), then a title/abstract fallback; the inspector says which kind of match it is | NCBI E-utilities |
+| MeSH descriptor ID → Wikidata item | **P486** lookup: browser cache and the prebuilt `mesh2qid.json` first, otherwise one lean SPARQL query for the missing IDs | Wikidata Query Service |
+| Labels, aliases, MeSH tree codes (**P672**) and all statements of those items | one `wbgetentities` call per 50 items, several in parallel | Wikibase API |
+| Does the relation already exist, with which references? | decided **locally** from the statements just fetched (both directions, any property, deprecated ones ignored, reference count and PubMed IDs) | – |
+| Property suggestion | rule-based domain/range scorer (default), or a **local LLM through Ollama** that must pick from the best-fitting candidates or answer `NONE` | your machine |
+| Reference | PubMed: 4 pairs share one search, 3 such groups share one abstract download; each abstract is then checked sentence by sentence for *both* items of the pair (names, aliases, MeSH heading), and a sentence containing a word typical for the property ranks first | NCBI E-utilities |
 | Export | QuickStatements V1 with `S698` (PubMed ID) and `S813` (retrieved) | – |
+
+### Why it is fast
+
+* The first batch appears while the 25 MB CSV is still being read (streamed parse); the rest is parsed in the background.
+* Wikidata work is a handful of parallel requests and the duplicate/reference check needs no SPARQL at all.
+* The next batch is resolved in the background while you review the current one, so paging is instant.
+* The local model and PubMed run concurrently with each other; results appear row by row, the selected row first.
+* Every request has a timeout (and one retry), so a slow server shows an error instead of hanging.
+* PubMed allows 3 requests/second, or 10 with a free [NCBI API key](https://www.ncbi.nlm.nih.gov/account/settings/):
+  paste it under *Property Classifier*. 100 pairs take about 35 requests, i.e. roughly 12 s without and 4 s with a key.
+* `scripts/build-mesh-map.mjs` (run by the deploy workflow, optional) downloads the whole MeSH→Wikidata table at build
+  time, so the browser needs no ID lookup at all.
 
 Nothing is faked: a MeSH ID with no Wikidata item (or a qualifier such as `Q000523`) is shown as unresolved and
 cannot be approved; failed network calls are shown as errors, never replaced by placeholder data.
 
 ## Things a curator must know
 
-* A PubMed hit means the two MeSH terms are indexed together in that paper. For properties without a subheading hint
-  this shows co-occurrence only, so read the paper before approving. The inspector says which kind of match it is.
+* A PubMed hit always names both items in its title/abstract; the inspector shows the matching sentence(s) and says
+  whether they also contain a word typical for the chosen property. That is evidence to read, not proof: check it
+  before approving. Other candidate papers can be selected with one click.
 * The duplicate check is derived from the *currently selected* property: changing the property updates it.
 * The "Approve novel" bulk action skips rows that are unresolved, already in Wikidata, not yet checked, or below the
   confidence threshold set under *Property Classifier*.
