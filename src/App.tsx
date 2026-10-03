@@ -20,9 +20,20 @@ import {
 } from './types';
 import { WIKIDATA_BIOMEDICAL_PROPERTIES } from './data/biomedicalOntology';
 import { classifyRuleBased, classifyWithOllama, loadConfig, saveConfig } from './lib/classifier';
-import { parseCsv, ParsedCsv, RawCsvRow } from './lib/csv';
-import { fetchPropertySpec, findExistingLinks, PropertyCheck, resolveMeshIds, verifyProperties } from './lib/wikidata';
-import { findPubMedReference } from './lib/pubmed';
+import { parseCsv, parseCsvStream, ParsedCsv, RawCsvRow } from './lib/csv';
+import {
+  computeLinks,
+  fetchPropertySpec,
+  labelLinks,
+  loadPersistedMeshMap,
+  loadPrebuiltMeshMap,
+  PropertyCheck,
+  resolveMeshBatch,
+  verifyProperties,
+  WdEntity,
+} from './lib/wikidata';
+import { findReferences, PairRequest } from './lib/pubmed';
+import { isAbortError } from './lib/net';
 import { canApprove, existingExact, isExactDuplicate } from './lib/quickstatements';
 import { RelationInspector } from './components/RelationInspector';
 import { QuickStatementsModal } from './components/QuickStatementsModal';
@@ -51,7 +62,7 @@ const pendingEntity = (meshId: string): MeshEntityInfo => ({
 });
 
 const isResolved = (e: MeshEntityInfo) => e.resolution === 'resolved' || e.resolution === 'ambiguous';
-const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError';
+const isAbort = isAbortError;
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const keyOf = (r: RawCsvRow) => `${r.subjectMeshId}_${r.objectMeshId}`;
 
@@ -90,8 +101,8 @@ export default function App() {
   const [activeNav, setActiveNav] = useState<'queue' | 'storage' | 'llm'>('queue');
   const [exportModalOpen, setExportModalOpen] = useState(false);
 
-  const [rawCsvString, setRawCsvString] = useState('');
-  const [parsed, setParsed] = useState<ParsedCsv>(() => parseCsv(SAMPLE_CSV));
+  const [rawCsvString, setRawCsvString] = useState(''); // only for uploaded CSVs; the bundled file is linked, not copied
+  const [parsed, setParsed] = useState<ParsedCsv>(() => ({ ...parseCsv(SAMPLE_CSV), complete: true }));
   const [csvSource, setCsvSource] = useState<'sample' | 'bundled' | 'upload'>('sample');
   const [currentBatchIndex, setCurrentBatchIndex] = useState(0);
   const [csvLoading, setCsvLoading] = useState(true);
@@ -118,7 +129,6 @@ export default function App() {
 
   // Candidate properties: the curated list minus any whose ID fails the live Wikidata label check.
   const [propChecks, setPropChecks] = useState<PropertyCheck[]>([]);
-  const [propsReady, setPropsReady] = useState(false);
   const [propertyWarnings, setPropertyWarnings] = useState<string[]>([]);
   // If (nearly) everything fails the check, the check itself is broken: keep the curated list rather than
   // switching the whole catalogue off.
@@ -158,13 +168,27 @@ export default function App() {
       .catch((e) => {
         if (!cancelled) setPropertyWarnings([`Property IDs could not be verified against Wikidata (${errMsg(e)}); using the curated list as is.`]);
       })
-      .finally(() => !cancelled && setPropsReady(true));
     return () => {
       cancelled = true;
     };
   }, [runPropertyCheck]);
 
-  const [pipeline, setPipeline] = useState<PipelineState | null>(null);
+  // Running stages (key -> progress), shown in the status line. Stages run concurrently.
+  const [stages, setStages] = useState<Record<string, PipelineState>>({});
+  const setStage = useCallback((key: string, st: PipelineState | null) => {
+    setStages((prev) => {
+      if (!st) {
+        if (!(key in prev)) return prev;
+        const c = { ...prev };
+        delete c[key];
+        return c;
+      }
+      return { ...prev, [key]: st };
+    });
+  }, []);
+  const busy = Object.keys(stages).length > 0;
+  const entityCache = useRef(new Map<string, WdEntity>());
+  const inflight = useRef(new Map<string, Promise<void>>());
   const [pipelineErrors, setPipelineErrors] = useState<string[]>([]);
   const runRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
@@ -173,30 +197,43 @@ export default function App() {
   const [hideDuplicates, setHideDuplicates] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRelationId, setSelectedRelationId] = useState<string | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedRelationId;
 
   const rows = parsed.rows;
 
-  // Load the bundled CSV once (it is served as a static file next to the app).
+  // Seed the MeSH -> item table (browser cache, optional prebuilt file) without delaying anything.
+  useEffect(() => {
+    loadPersistedMeshMap();
+    loadPrebuiltMeshMap();
+  }, []);
+
+  // Stream the bundled CSV: batch 1 is usable as soon as its first 100 rows have arrived,
+  // the remaining ~835k rows are parsed in the background.
   useEffect(() => {
     let cancelled = false;
-    fetch('./data/missing_rels.csv')
-      .then((res) => {
+    (async () => {
+      try {
+        const res = await fetch('./data/missing_rels.csv');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.text();
-      })
-      .then((text) => {
-        if (cancelled) return;
-        const p = parseCsv(text);
-        if (p.rows.length > 0) {
-          setRawCsvString(text);
-          setParsed(p);
-          setCsvSource('bundled');
+        await parseCsvStream(
+          res,
+          (allRows, skipped, complete) => {
+            if (cancelled) return;
+            setParsed({ rows: allRows, skipped, complete });
+            setCsvSource('bundled');
+            setCsvLoading(false);
+          },
+          MAX_BATCH_SIZE,
+          () => cancelled
+        );
+      } catch {
+        if (!cancelled) {
+          setPipelineErrors(['Could not load ./data/missing_rels.csv; showing a 6-row sample. Upload your CSV on the Pipeline Storage tab.']);
+          setCsvLoading(false);
         }
-      })
-      .catch(() => {
-        if (!cancelled) setPipelineErrors(['Could not load ./data/missing_rels.csv; showing a 6-row sample. Upload your CSV on the Pipeline Storage tab.']);
-      })
-      .finally(() => !cancelled && setCsvLoading(false));
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -228,6 +265,7 @@ export default function App() {
       llmPrediction: prediction,
       wikidataVerification: { state: unresolved(subject) || unresolved(object) ? 'skipped' : 'pending', existing: [] },
       pubmedReference: null,
+      pubmedCandidates: [],
       pubmedState: 'idle',
       status: 'pending',
       updatedAt: new Date().toISOString(),
@@ -235,11 +273,45 @@ export default function App() {
   }, []);
 
   /**
-   * Real enrichment pipeline for one batch of <=100 rows:
-   *  1. one SPARQL query maps all MeSH descriptor IDs to Wikidata items (P486)
-   *  2. one SPARQL query finds existing statements between each resolved pair
-   *  3. optional local LLM (Ollama) picks the property, row by row
-   *  4. PubMed E-utilities search finds a reference, row by row (rate limited)
+   * MeSH IDs -> Wikidata items + their statements. One shared in-flight table makes a prefetch of the next
+   * batch and a user-triggered load of the same batch share the same requests. Not tied to a batch's abort
+   * signal: the result is cached either way, and timeouts bound the wait.
+   */
+  const ensureResolved = useCallback(async (meshIds: string[]) => {
+    const need = Array.from(new Set(meshIds.filter((id) => !meshCache.current.has(id) && !inflight.current.has(id))));
+    if (need.length > 0) {
+      const job = resolveMeshBatch(need).then(({ infos, entities }) => {
+        for (const [id, e] of infos) meshCache.current.set(id, e);
+        for (const [q, e] of entities) entityCache.current.set(q, e);
+      });
+      const tracked = job.finally(() => need.forEach((id) => inflight.current.delete(id)));
+      need.forEach((id) => inflight.current.set(id, tracked));
+      tracked.catch(() => undefined);
+    }
+    const waits = new Set(meshIds.map((id) => inflight.current.get(id)).filter((x): x is Promise<void> => !!x));
+    await Promise.all(waits);
+  }, []);
+
+  const sliceOf = useCallback((allRows: RawCsvRow[], batchIdx: number) => allRows.slice(batchIdx * MAX_BATCH_SIZE, (batchIdx + 1) * MAX_BATCH_SIZE), []);
+
+  // Resolve the next batch quietly while the curator reads this one, so moving on is instant.
+  const prefetchBatch = useCallback(
+    async (batchIdx: number, allRows: RawCsvRow[]) => {
+      const slice = sliceOf(allRows, batchIdx);
+      if (slice.length === 0) return;
+      try {
+        await ensureResolved(slice.flatMap((r) => [r.subjectMeshId, r.objectMeshId]));
+      } catch {
+        /* silent: the normal load will report any real problem */
+      }
+    },
+    [ensureResolved, sliceOf]
+  );
+
+  /**
+   * Enrichment of one batch of <=100 rows. Wikidata work is a handful of parallel requests
+   * (one SPARQL ID lookup, one wbgetentities call per 50 items) and the "does the relation exist /
+   * does it have references" check is then done locally. The local model and PubMed run concurrently.
    */
   const loadBatch = useCallback(
     async (batchIdx: number, allRows: RawCsvRow[], force = false) => {
@@ -249,7 +321,7 @@ export default function App() {
       abortRef.current = ac;
       const stale = () => runRef.current !== runId || ac.signal.aborted;
 
-      const slice = allRows.slice(batchIdx * MAX_BATCH_SIZE, (batchIdx + 1) * MAX_BATCH_SIZE);
+      const slice = sliceOf(allRows, batchIdx);
       if (slice.length === 0) return;
       setPipelineErrors((prev) => prev.filter((m) => m.startsWith('Could not load ./data')));
 
@@ -268,31 +340,24 @@ export default function App() {
       });
       setSelectedRelationId((prev) => (prev && slice.some((r) => keyOf(r) === prev) ? prev : keyOf(slice[0])));
 
-      const errors: string[] = [];
-      const fail = (m: string) => {
-        errors.push(m);
-        setPipelineErrors((prev) => [...prev.filter((x) => x !== m), m]);
-      };
+      const fail = (m: string) => setPipelineErrors((prev) => [...prev.filter((x) => x !== m), m]);
 
-      try {
-        // 1. MeSH -> Wikidata -------------------------------------------------
-        const need = Array.from(
-          new Set(slice.flatMap((r) => [r.subjectMeshId, r.objectMeshId]).filter((id) => !meshCache.current.has(id)))
-        );
-        if (need.length > 0) {
-          setPipeline({ label: `Resolving ${need.length} MeSH descriptors through Wikidata (P486)`, done: 0, total: 1 });
-          try {
-            const resolved = await resolveMeshIds(need, ac.signal);
-            if (stale()) return;
-            for (const [id, e] of resolved) meshCache.current.set(id, e);
-          } catch (e) {
-            if (isAbort(e) || stale()) return;
-            fail(`MeSH to Wikidata lookup failed: ${errMsg(e)}. Use "Re-run checks" to retry.`);
-            for (const id of need) {
-              meshCache.current.set(id, { ...pendingEntity(id), resolution: 'error', description: `Lookup failed: ${errMsg(e)}` });
-            }
+      const resolveAndCheck = async () => {
+        const ids = slice.flatMap((r) => [r.subjectMeshId, r.objectMeshId]);
+        const needFetch = ids.some((id) => !meshCache.current.has(id));
+        if (needFetch) setStage('wikidata', { label: 'Resolving MeSH IDs on Wikidata', done: 0, total: 1 });
+        try {
+          await ensureResolved(ids);
+        } catch (e) {
+          if (stale()) return;
+          fail(`MeSH to Wikidata lookup failed: ${errMsg(e)}. Use "Re-run checks" to retry.`);
+          for (const id of ids) {
+            if (!meshCache.current.has(id)) meshCache.current.set(id, { ...pendingEntity(id), resolution: 'error', description: `Lookup failed: ${errMsg(e)}` });
           }
         }
+        if (stale()) return;
+
+        // apply resolution to the records
         commit((copy) => {
           for (const r of slice) {
             const rec = copy.get(keyOf(r));
@@ -319,100 +384,163 @@ export default function App() {
           }
         });
 
-        // 2. Existing statements ---------------------------------------------
+        // Does the relation already exist, and with which references? Answered from the fetched statements.
         const toCheck = slice
           .map((r) => recordsRef.current.get(keyOf(r)))
           .filter((r): r is ProcessedRelationRecord => !!r && !!r.subject.qid && !!r.object.qid && r.wikidataVerification.state !== 'checked');
         if (toCheck.length > 0) {
-          setPipeline({ label: `Checking ${toCheck.length} pairs for existing Wikidata statements`, done: 0, total: 1 });
-          try {
-            const links = await findExistingLinks(
-              toCheck.map((r) => ({ key: r.id, subjectQid: r.subject.qid!, objectQid: r.object.qid! })),
-              ac.signal
-            );
-            if (stale()) return;
-            const checkedAt = new Date().toISOString();
-            commit((copy) => {
-              for (const r of toCheck) {
-                const rec = copy.get(r.id);
-                if (rec) copy.set(r.id, { ...rec, wikidataVerification: { state: 'checked', existing: links.get(r.id) ?? [], checkedAt } });
-              }
-            });
-          } catch (e) {
-            if (isAbort(e) || stale()) return;
-            fail(`Wikidata duplicate check failed: ${errMsg(e)}. Rows stay unchecked; use "Re-run checks" to retry.`);
-            commit((copy) => {
-              for (const r of toCheck) {
-                const rec = copy.get(r.id);
-                if (rec) copy.set(r.id, { ...rec, wikidataVerification: { state: 'error', existing: [], error: errMsg(e) } });
-              }
-            });
-          }
+          const missing = toCheck.filter((r) => !entityCache.current.has(r.subject.qid!) || !entityCache.current.has(r.object.qid!));
+          const ready = toCheck.filter((r) => !missing.includes(r));
+          const links = computeLinks(
+            ready.map((r) => ({ key: r.id, subjectQid: r.subject.qid!, objectQid: r.object.qid! })),
+            entityCache.current
+          );
+          await labelLinks(links, ac.signal).catch(() => undefined);
+          if (stale()) return;
+          const checkedAt = new Date().toISOString();
+          commit((copy) => {
+            for (const r of ready) {
+              const rec = copy.get(r.id);
+              if (rec) copy.set(r.id, { ...rec, wikidataVerification: { state: 'checked', existing: links.get(r.id) ?? [], checkedAt } });
+            }
+            for (const r of missing) {
+              const rec = copy.get(r.id);
+              if (rec) copy.set(r.id, { ...rec, wikidataVerification: { state: 'error', existing: [], error: 'statement data was not loaded' } });
+            }
+          });
         }
+        setStage('wikidata', null);
+      };
 
-        // 3. Optional local LLM ------------------------------------------------
+      const llmStage = async () => {
         const cfg = configRef.current;
-        if (cfg.mode === 'ollama') {
-          const todo = slice
-            .map((r) => recordsRef.current.get(keyOf(r)))
-            .filter((r): r is ProcessedRelationRecord => !!r && r.llmPrediction.engine === 'rule-based' && r.status === 'pending' && isResolved(r.subject) && isResolved(r.object));
+        if (cfg.mode !== 'ollama') return;
+        const todo = slice
+          .map((r) => recordsRef.current.get(keyOf(r)))
+          .filter((r): r is ProcessedRelationRecord => !!r && r.llmPrediction.engine === 'rule-based' && r.status === 'pending' && isResolved(r.subject) && isResolved(r.object));
+        try {
           for (let i = 0; i < todo.length; i++) {
             if (stale()) return;
-            setPipeline({ label: `Asking ${cfg.ollamaModel} to choose properties`, done: i, total: todo.length });
+            setStage('llm', { label: `Asking ${cfg.ollamaModel} to choose properties`, done: i, total: todo.length });
             const rec = todo[i];
-            try {
-              const pred = await classifyWithOllama(cfg, rec.subject, rec.object, rec.pmi, ac.signal, propsRef.current);
-              if (stale()) return;
-              patch(rec.id, (cur) => ({
-                ...cur,
-                llmPrediction: pred,
-                selectedProperty: cur.selectedProperty.pid === cur.llmPrediction.recommendedProperty.pid ? pred.recommendedProperty : cur.selectedProperty,
-              }));
-            } catch (e) {
-              if (isAbort(e) || stale()) return;
-              fail(`Local model unavailable (${errMsg(e)}). Falling back to the rule-based scorer for this batch. Is Ollama running with OLLAMA_ORIGINS set for this site?`);
-              break;
-            }
-          }
-        }
-
-        // 4. PubMed references ---------------------------------------------------
-        const refRows = slice
-          .map((r) => recordsRef.current.get(keyOf(r)))
-          .filter((r): r is ProcessedRelationRecord => !!r && isResolved(r.subject) && isResolved(r.object) && (r.pubmedState === 'idle' || (force && r.pubmedState === 'error')) && !((existingExact(r)?.referenceCount ?? 0) > 0));
-        for (let i = 0; i < refRows.length; i++) {
-          if (stale()) return;
-          setPipeline({ label: 'Searching PubMed for references', done: i, total: refRows.length });
-          const rec = recordsRef.current.get(refRows[i].id) ?? refRows[i];
-          patch(rec.id, (c) => ({ ...c, pubmedState: 'loading' }));
-          try {
-            const ref = await findPubMedReference({
-              subjectLabel: rec.subject.label,
-              objectLabel: rec.object.label,
-              pid: rec.selectedProperty.pid,
-              apiKey: configRef.current.ncbiApiKey,
-              signal: ac.signal,
-            });
+            const pred = await classifyWithOllama(cfg, rec.subject, rec.object, rec.pmi, ac.signal, propsRef.current);
             if (stale()) return;
-            patch(rec.id, (c) => ({ ...c, pubmedReference: ref, pubmedState: ref ? 'found' : 'none', pubmedError: undefined }));
-          } catch (e) {
-            if (isAbort(e) || stale()) return;
-            patch(rec.id, (c) => ({ ...c, pubmedState: 'error', pubmedError: errMsg(e) }));
-            fail(`PubMed search error: ${errMsg(e)}`);
-            if (/429/.test(errMsg(e))) break;
+            patch(rec.id, (cur) => ({
+              ...cur,
+              llmPrediction: pred,
+              selectedProperty: cur.selectedProperty.pid === cur.llmPrediction.recommendedProperty.pid ? pred.recommendedProperty : cur.selectedProperty,
+            }));
           }
+        } catch (e) {
+          if (isAbort(e) || stale()) return;
+          fail(`Local model unavailable (${errMsg(e)}). Falling back to the rule-based scorer for this batch. Is Ollama running with OLLAMA_ORIGINS set for this site?`);
+        } finally {
+          setStage('llm', null);
         }
+      };
+
+      const pubmedStage = async () => {
+        // PubMed needs the names of both items, so wait for the resolution but not for the duplicate check.
+        const ids = slice.flatMap((r) => [r.subjectMeshId, r.objectMeshId]);
+        try {
+          await ensureResolved(ids);
+        } catch {
+          return;
+        }
+        if (stale()) return;
+        const rowsToSearch = slice
+          .map((r) => recordsRef.current.get(keyOf(r)))
+          .filter(
+            (r): r is ProcessedRelationRecord =>
+              !!r &&
+              isResolved(r.subject) &&
+              isResolved(r.object) &&
+              (r.pubmedState === 'idle' || (force && r.pubmedState === 'error')) &&
+              !((existingExact(r)?.referenceCount ?? 0) > 0)
+          )
+          // the row the curator is looking at first
+          .sort((a, b) => Number(b.id === selectedIdRef.current) - Number(a.id === selectedIdRef.current));
+        if (rowsToSearch.length === 0) return;
+        const queued = new Set(rowsToSearch.map((r) => r.id));
+        commit((copy) => {
+          for (const r of rowsToSearch) {
+            const rec = copy.get(r.id);
+            if (rec) copy.set(r.id, { ...rec, pubmedState: 'loading', pubmedError: undefined });
+          }
+        });
+        let done = 0;
+        const total = rowsToSearch.length;
+        setStage('pubmed', { label: 'Searching PubMed', done: 0, total });
+        const requests: PairRequest[] = rowsToSearch.map((r) => ({
+          id: r.id,
+          subject: { label: r.subject.label, aliases: r.subject.aliases },
+          object: { label: r.object.label, aliases: r.object.aliases },
+          pid: r.selectedProperty.pid,
+        }));
+        try {
+          await findReferences(requests, {
+            apiKey: configRef.current.ncbiApiKey,
+            signal: ac.signal,
+            onResult: (res) => {
+              queued.delete(res.id);
+              done++;
+              if (!stale()) setStage('pubmed', { label: 'Searching PubMed', done, total });
+              patch(res.id, (c) =>
+                'error' in res
+                  ? { ...c, pubmedState: 'error', pubmedError: res.error }
+                  : { ...c, pubmedReference: res.best, pubmedCandidates: res.candidates, pubmedState: res.best ? 'found' : 'none', pubmedError: undefined }
+              );
+            },
+          });
+        } catch (e) {
+          if (!isAbort(e) && !stale()) fail(`PubMed search error: ${errMsg(e)}`);
+        } finally {
+          // a cancelled run must not leave rows stuck on "searching"
+          if (queued.size > 0) {
+            commit((copy) => {
+              for (const id of queued) {
+                const rec = copy.get(id);
+                if (rec && rec.pubmedState === 'loading') copy.set(id, { ...rec, pubmedState: 'idle' });
+              }
+            });
+          }
+          setStage('pubmed', null);
+        }
+      };
+
+      try {
+        await resolveAndCheck();
+        if (stale()) return;
+        void prefetchBatch(batchIdx + 1, allRows);
+        await Promise.all([llmStage(), pubmedStage()]);
       } finally {
-        if (runRef.current === runId) setPipeline(null);
+        if (runRef.current === runId) setStage('wikidata', null);
       }
     },
-    [makeRecord, patch, commit]
+    [makeRecord, patch, commit, ensureResolved, prefetchBatch, setStage, sliceOf]
   );
 
   useEffect(() => {
-    if (!csvLoading && propsReady && rows.length > 0) loadBatch(currentBatchIndex, rows);
+    if (!csvLoading && rows.length > 0) loadBatch(currentBatchIndex, rows);
     return () => abortRef.current?.abort();
-  }, [currentBatchIndex, rows, csvLoading, propsReady, loadBatch]);
+  }, [currentBatchIndex, rows, csvLoading, loadBatch]);
+
+  // Property IDs that fail the live check disappear from the candidates; re-score rows that used them.
+  useEffect(() => {
+    if (excludedPids.length === 0) return;
+    commit((copy) => {
+      for (const rec of copy.values()) {
+        const usesBad = excludedPids.includes(rec.selectedProperty.pid) || excludedPids.includes(rec.llmPrediction.recommendedProperty.pid);
+        if (!usesBad || rec.llmPrediction.engine !== 'rule-based') continue;
+        const pred = classifyRuleBased(rec.subject, rec.object, rec.pmi, propsRef.current);
+        copy.set(rec.id, {
+          ...rec,
+          llmPrediction: pred,
+          selectedProperty: excludedPids.includes(rec.selectedProperty.pid) ? pred.recommendedProperty : rec.selectedProperty,
+        });
+      }
+    });
+  }, [excludedPids, commit]);
 
   const currentBatchRelations = useMemo(() => {
     const slice = rows.slice(currentBatchIndex * MAX_BATCH_SIZE, (currentBatchIndex + 1) * MAX_BATCH_SIZE);
@@ -420,6 +548,12 @@ export default function App() {
   }, [currentBatchIndex, rows, processedRelations]);
 
   const totalBatches = Math.max(1, Math.ceil(rows.length / MAX_BATCH_SIZE));
+  // A few thousand <option> elements make every re-render slow: list only the neighbourhood (plus first and last).
+  const batchOptions = useMemo(() => {
+    const set = new Set<number>([0, totalBatches - 1]);
+    for (let i = Math.max(0, currentBatchIndex - 25); i <= Math.min(totalBatches - 1, currentBatchIndex + 25); i++) set.add(i);
+    return Array.from(set).sort((a, b) => a - b);
+  }, [currentBatchIndex, totalBatches]);
   const loadingBatch = csvLoading;
 
   const handleDecision = useCallback(
@@ -455,23 +589,39 @@ export default function App() {
   const optionsFor = (rel: ProcessedRelationRecord): WikidataPropertySpec[] =>
     activeProps.some((x) => x.pid === rel.selectedProperty.pid) ? activeProps : [rel.selectedProperty, ...activeProps];
 
-  // Manual PubMed refresh for one row, using the property currently selected.
+  // Manual PubMed refresh for one row, using the property currently selected; jumps the queue.
   const handleRefreshPubMed = useCallback(
     async (id: string) => {
       const item = recordsRef.current.get(id);
       if (!item) return;
       patch(id, (c) => ({ ...c, pubmedState: 'loading', pubmedError: undefined }));
       try {
-        const ref = await findPubMedReference({
-          subjectLabel: item.subject.label,
-          objectLabel: item.object.label,
-          pid: item.selectedProperty.pid,
-          apiKey: configRef.current.ncbiApiKey,
-        });
-        patch(id, (c) => ({ ...c, pubmedReference: ref, pubmedState: ref ? 'found' : 'none' }));
+        await findReferences(
+          [{ id, subject: { label: item.subject.label, aliases: item.subject.aliases }, object: { label: item.object.label, aliases: item.object.aliases }, pid: item.selectedProperty.pid }],
+          {
+            apiKey: configRef.current.ncbiApiKey,
+            priority: 100000,
+            onResult: (res) =>
+              patch(id, (c) =>
+                'error' in res
+                  ? { ...c, pubmedState: 'error', pubmedError: res.error }
+                  : { ...c, pubmedReference: res.best, pubmedCandidates: res.candidates, pubmedState: res.best ? 'found' : 'none', pubmedError: undefined }
+              ),
+          }
+        );
       } catch (e) {
         patch(id, (c) => ({ ...c, pubmedState: 'error', pubmedError: errMsg(e) }));
       }
+    },
+    [patch]
+  );
+
+  const handleSelectPubmed = useCallback(
+    (id: string, pmid: string) => {
+      patch(id, (c) => {
+        const ref = c.pubmedCandidates.find((x) => x.pmid === pmid);
+        return ref ? { ...c, pubmedReference: ref } : c;
+      });
     },
     [patch]
   );
@@ -703,8 +853,9 @@ export default function App() {
                 Batch {currentBatchIndex + 1} of {totalBatches} (Rows{' '}
                 {currentBatchIndex * MAX_BATCH_SIZE + 1}–
                 {Math.min((currentBatchIndex + 1) * MAX_BATCH_SIZE, rows.length)} of{' '}
-                {rows.length})
+                {rows.length.toLocaleString()}{parsed.complete === false ? '+' : ''})
               </span>
+              {parsed.complete === false && <span className="text-slate-500">reading file…</span>}
               <span aria-hidden="true">·</span>
               <span className="text-blue-700 font-medium">
                 Workload Cap: 100 relations / batch
@@ -722,7 +873,7 @@ export default function App() {
                 onChange={(e) => setCurrentBatchIndex(parseInt(e.target.value, 10))}
                 className="text-xs font-mono bg-slate-50 border border-slate-300 rounded px-2.5 py-1.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
               >
-                {Array.from({ length: totalBatches }).map((_, idx) => {
+                {batchOptions.map((idx) => {
                   const start = idx * 100 + 1;
                   const end = Math.min((idx + 1) * 100, rows.length);
                   return (
@@ -732,6 +883,20 @@ export default function App() {
                   );
                 })}
               </select>
+              <input
+                id="batch-jump"
+                type="number"
+                min={1}
+                max={totalBatches}
+                placeholder="Go to #"
+                aria-label="Go to batch number"
+                className="w-20 text-xs font-mono bg-slate-50 border border-slate-300 rounded px-2 py-1.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  const n = parseInt((e.target as HTMLInputElement).value, 10);
+                  if (Number.isFinite(n)) setCurrentBatchIndex(Math.min(totalBatches, Math.max(1, n)) - 1);
+                }}
+              />
 
               <button
                 type="button"
@@ -755,13 +920,16 @@ export default function App() {
           </div>
 
           {/* Live pipeline status & errors */}
-          {(pipeline || pipelineErrors.length > 0 || propertyWarnings.length > 0 || batchCounts.unresolved > 0) && (
+          {(busy || pipelineErrors.length > 0 || propertyWarnings.length > 0 || batchCounts.unresolved > 0 || !config.ncbiApiKey) && (
             <div className="px-6 py-2 bg-white border-b border-slate-200 space-y-1 text-xs">
-              {pipeline && (
-                <p className="text-blue-700 font-medium tabular-nums">
-                  ⟳ {pipeline.label}
-                  {pipeline.total > 1 ? ` (${pipeline.done}/${pipeline.total})` : '…'}
+              {Object.entries(stages).map(([key, st]) => (
+                <p key={key} className="text-blue-700 font-medium tabular-nums">
+                  ⟳ {st.label}
+                  {st.total > 1 ? ` (${st.done}/${st.total})` : '…'}
                 </p>
+              ))}
+              {!config.ncbiApiKey && stages.pubmed && (
+                <p className="text-slate-500">PubMed allows 3 requests per second without an API key. A free NCBI key (Property Classifier tab) makes the reference search about three times faster.</p>
               )}
               {[...propertyWarnings, ...pipelineErrors].map((m) => (
                 <p key={m} className="text-amber-800 flex items-start gap-1.5">
@@ -859,11 +1027,11 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleRerun}
-                disabled={!!pipeline}
+                disabled={busy}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
                 title="Retry failed Wikidata, PubMed or local-model calls for this batch"
               >
-                <RefreshCw className={`w-3.5 h-3.5 ${pipeline ? 'animate-spin' : ''}`} />
+                <RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} />
                 <span>Re-run checks</span>
               </button>
               <button
@@ -1118,6 +1286,7 @@ export default function App() {
               onDecision={handleDecision}
               onPropertyChange={handlePropertyChange}
               onRefreshPubMed={handleRefreshPubMed}
+              onSelectPubmed={handleSelectPubmed}
               canApprove={selectedRelation ? canApprove(selectedRelation) : false}
             />
           </div>

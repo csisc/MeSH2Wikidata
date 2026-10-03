@@ -30,6 +30,8 @@ export interface MeshEntityInfo {
   description: string;
   semanticGroup: SemanticGroup | null;
   treeNumbers: string[];
+  /** English aliases from Wikidata, used as extra PubMed search names */
+  aliases?: string[];
   resolution: MeshResolution;
   candidateQids?: string[];
 }
@@ -57,10 +59,16 @@ export interface PubMedReference {
   pubDate: string;
   authors: string;
   queryUsed: string;
-  /** relation-specific: query also contained a subheading/keyword hint for the property; co-indexed: both MeSH terms only */
-  matchLevel: 'relation-specific' | 'co-indexed' | 'text-mention';
-  /** number of PubMed records matching the query that produced this reference */
+  /**
+   * sentence-with-relation: one sentence names both items and a keyword typical for the property
+   * sentence:               one sentence names both items
+   * abstract:               both items occur in title/abstract, but not in the same sentence
+   */
+  matchLevel: 'sentence-with-relation' | 'sentence' | 'abstract';
+  /** number of PubMed records matching the search that produced this reference */
   hitCount: number;
+  /** up to two sentences from the abstract that mention the items */
+  evidence: string[];
 }
 
 export type PubMedState = 'idle' | 'loading' | 'found' | 'none' | 'error';
@@ -108,6 +116,8 @@ export interface ProcessedRelationRecord {
   llmPrediction: LlmPrediction;
   wikidataVerification: WikidataVerification;
   pubmedReference: PubMedReference | null;
+  /** other papers returned by the same search (the chosen one is pubmedReference) */
+  pubmedCandidates: PubMedReference[];
   pubmedState: PubMedState;
   pubmedError?: string;
   status: 'pending' | 'approved' | 'rejected';
