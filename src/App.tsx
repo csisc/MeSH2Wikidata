@@ -23,7 +23,7 @@ import { classifyRuleBased, classifyWithOllama, loadConfig, saveConfig } from '.
 import { parseCsv, ParsedCsv, RawCsvRow } from './lib/csv';
 import { fetchPropertySpec, findExistingLinks, PropertyCheck, resolveMeshIds, verifyProperties } from './lib/wikidata';
 import { findPubMedReference } from './lib/pubmed';
-import { canApprove, isExactDuplicate } from './lib/quickstatements';
+import { canApprove, existingExact, isExactDuplicate } from './lib/quickstatements';
 import { RelationInspector } from './components/RelationInspector';
 import { QuickStatementsModal } from './components/QuickStatementsModal';
 import { StorageAndLlmPanel } from './components/StorageAndLlmPanel';
@@ -120,11 +120,16 @@ export default function App() {
   const [propChecks, setPropChecks] = useState<PropertyCheck[]>([]);
   const [propsReady, setPropsReady] = useState(false);
   const [propertyWarnings, setPropertyWarnings] = useState<string[]>([]);
-  const activeProps = useMemo(() => {
-    const bad = new Set(propChecks.filter((c) => !c.ok).map((c) => c.pid));
-    return WIKIDATA_BIOMEDICAL_PROPERTIES.filter((x) => !bad.has(x.pid));
+  // If (nearly) everything fails the check, the check itself is broken: keep the curated list rather than
+  // switching the whole catalogue off.
+  const excludedPids = useMemo(() => {
+    const bad = propChecks.filter((c) => !c.ok).map((c) => c.pid);
+    return propChecks.length > 0 && bad.length > propChecks.length / 2 ? [] : bad;
   }, [propChecks]);
-  const excludedPids = useMemo(() => propChecks.filter((c) => !c.ok).map((c) => c.pid), [propChecks]);
+  const activeProps = useMemo(
+    () => WIKIDATA_BIOMEDICAL_PROPERTIES.filter((x) => !excludedPids.includes(x.pid)),
+    [excludedPids]
+  );
   const propsRef = useRef<WikidataPropertySpec[]>(WIKIDATA_BIOMEDICAL_PROPERTIES);
   propsRef.current = activeProps;
   const customProps = useRef(new Map<string, WikidataPropertySpec>());
@@ -140,7 +145,11 @@ export default function App() {
     runPropertyCheck()
       .then((res) => {
         const bad = res.filter((c) => !c.ok);
-        if (!cancelled && bad.length > 0) {
+        if (!cancelled && bad.length > res.length / 2) {
+          setPropertyWarnings([
+            `${bad.length} of ${res.length} property IDs failed the Wikidata label check, which looks like a problem with the check, not with the IDs. Using the curated list unchanged; open Property Classifier to inspect.`,
+          ]);
+        } else if (!cancelled && bad.length > 0) {
           setPropertyWarnings([
             `${bad.length} configured property ID(s) do not match their Wikidata label and were switched off: ${bad.map((b) => b.pid).join(', ')}. See Property Classifier.`,
           ]);
@@ -370,7 +379,7 @@ export default function App() {
         // 4. PubMed references ---------------------------------------------------
         const refRows = slice
           .map((r) => recordsRef.current.get(keyOf(r)))
-          .filter((r): r is ProcessedRelationRecord => !!r && isResolved(r.subject) && isResolved(r.object) && (r.pubmedState === 'idle' || (force && r.pubmedState === 'error')));
+          .filter((r): r is ProcessedRelationRecord => !!r && isResolved(r.subject) && isResolved(r.object) && (r.pubmedState === 'idle' || (force && r.pubmedState === 'error')) && !((existingExact(r)?.referenceCount ?? 0) > 0));
         for (let i = 0; i < refRows.length; i++) {
           if (stale()) return;
           setPipeline({ label: 'Searching PubMed for references', done: i, total: refRows.length });
@@ -1006,8 +1015,8 @@ export default function App() {
                             ) : rel.wikidataVerification.state === 'skipped' ? (
                               <span className="text-slate-400">— unresolved</span>
                             ) : isExactDuplicate(rel) ? (
-                              <span className="text-amber-700 font-medium" title="This exact statement already exists in Wikidata">
-                                ▲ Duplicate ({rel.selectedProperty.pid})
+                              <span className="text-amber-700 font-medium" title={(existingExact(rel)?.referenceCount ?? 0) > 0 ? `This statement already exists in Wikidata with ${existingExact(rel)!.referenceCount} reference(s)${existingExact(rel)!.pmids.length ? ` (PMID ${existingExact(rel)!.pmids.join(", ")})` : ""}` : "This statement already exists in Wikidata but has no reference"}>
+                                ▲ Exists ({rel.selectedProperty.pid}){(existingExact(rel)?.referenceCount ?? 0) > 0 ? ` · ${existingExact(rel)!.referenceCount} ref` : ' · no ref'}
                               </span>
                             ) : rel.wikidataVerification.existing.length > 0 ? (
                               <span

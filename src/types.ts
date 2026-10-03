@@ -58,7 +58,7 @@ export interface PubMedReference {
   authors: string;
   queryUsed: string;
   /** relation-specific: query also contained a subheading/keyword hint for the property; co-indexed: both MeSH terms only */
-  matchLevel: 'relation-specific' | 'co-indexed';
+  matchLevel: 'relation-specific' | 'co-indexed' | 'text-mention';
   /** number of PubMed records matching the query that produced this reference */
   hitCount: number;
 }
@@ -70,6 +70,10 @@ export interface ExistingLink {
   label: string;
   /** forward: subject -> object, reverse: object -> subject */
   direction: 'forward' | 'reverse';
+  /** number of references on the existing statement(s) (deprecated statements ignored) */
+  referenceCount: number;
+  /** PubMed IDs (P698) found in those references */
+  pmids: string[];
 }
 
 export interface WikidataVerification {
