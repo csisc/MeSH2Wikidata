@@ -12,13 +12,26 @@ export type SemanticGroup =
   | 'Epidemiology & Healthcare'
   | 'Environmental & Chemical';
 
+/**
+ * How a MeSH identifier was (or was not) mapped to a Wikidata item.
+ *  - resolved:   exactly one item carries this MeSH descriptor ID (P486)
+ *  - ambiguous:  several items carry it; the first is shown, curator must check
+ *  - not-found:  no item has this descriptor ID
+ *  - qualifier:  a MeSH qualifier/subheading (Qxxxxxx), not a descriptor
+ *  - pending:    lookup not finished yet
+ *  - error:      lookup failed (network, rate limit...)
+ */
+export type MeshResolution = 'resolved' | 'ambiguous' | 'not-found' | 'qualifier' | 'pending' | 'error';
+
 export interface MeshEntityInfo {
   meshId: string;
-  qid: string;
+  qid: string | null;
   label: string;
   description: string;
-  semanticGroup: SemanticGroup;
-  treeNumber?: string;
+  semanticGroup: SemanticGroup | null;
+  treeNumbers: string[];
+  resolution: MeshResolution;
+  candidateQids?: string[];
 }
 
 export interface WikidataPropertySpec {
@@ -38,16 +51,38 @@ export interface PubMedReference {
   pubDate: string;
   authors: string;
   queryUsed: string;
-  source: 'ncbi-eutils-live' | 'pubmed-indexed-cache';
+  /** relation-specific: query also contained a subheading/keyword hint for the property; co-indexed: both MeSH terms only */
+  matchLevel: 'relation-specific' | 'co-indexed';
+  /** number of PubMed records matching the query that produced this reference */
+  hitCount: number;
+}
+
+export type PubMedState = 'idle' | 'loading' | 'found' | 'none' | 'error';
+
+export interface ExistingLink {
+  pid: string;
+  label: string;
+  /** forward: subject -> object, reverse: object -> subject */
+  direction: 'forward' | 'reverse';
 }
 
 export interface WikidataVerification {
-  existsInWikidata: boolean;
-  existingPropertyId?: string;
-  existingPropertyLabel?: string;
-  checkedAt: string;
-  sparqlEndpoint: string;
-  verificationMode: 'live-sparql' | 'local-kg-index';
+  state: 'pending' | 'checked' | 'error' | 'skipped';
+  existing: ExistingLink[];
+  checkedAt?: string;
+  error?: string;
+}
+
+export interface LlmPrediction {
+  recommendedProperty: WikidataPropertySpec;
+  confidence: number;
+  reasoning: string;
+  alternatives: Array<{ property: WikidataPropertySpec; score: number }>;
+  modelId: string;
+  latencyMs: number;
+  engine: 'rule-based' | 'ollama';
+  /** set when an Ollama call was requested but failed and the rule-based result is shown instead */
+  fallbackReason?: string;
 }
 
 export interface ProcessedRelationRecord {
@@ -60,16 +95,11 @@ export interface ProcessedRelationRecord {
   subject: MeshEntityInfo;
   object: MeshEntityInfo;
   selectedProperty: WikidataPropertySpec;
-  llmPrediction: {
-    recommendedProperty: WikidataPropertySpec;
-    confidence: number;
-    reasoning: string;
-    alternatives: Array<{ property: WikidataPropertySpec; score: number }>;
-    modelId: string;
-    latencyMs: number;
-  };
+  llmPrediction: LlmPrediction;
   wikidataVerification: WikidataVerification;
-  pubmedReference: PubMedReference;
+  pubmedReference: PubMedReference | null;
+  pubmedState: PubMedState;
+  pubmedError?: string;
   status: 'pending' | 'approved' | 'rejected';
   updatedAt: string;
 }
@@ -78,6 +108,7 @@ export interface DatasetInfoResponse {
   fileName: string;
   storagePath: string;
   totalRows: number;
+  skippedRows: number;
   maxBatchSize: number;
   totalBatches: number;
   processedTotal: number;
@@ -90,20 +121,13 @@ export interface DatasetInfoResponse {
   availableProperties: WikidataPropertySpec[];
 }
 
-export interface BatchResponse {
-  batchIndex: number;
-  batchSize: number;
-  startRow: number;
-  endRow: number;
-  totalRows: number;
-  totalBatches: number;
-  relations: ProcessedRelationRecord[];
-}
-
-export interface QuickStatementsExportResponse {
-  count: number;
-  v1TabSeparated: string;
-  v1PipeCommands: string;
-  v2Csv: string;
-  records: ProcessedRelationRecord[];
+export interface LlmConfig {
+  mode: 'rule-based' | 'ollama';
+  /** Base URL of the Ollama server, e.g. http://localhost:11434 */
+  ollamaUrl: string;
+  ollamaModel: string;
+  /** Rows below this confidence are not touched by "Approve all novel in batch" */
+  minConfidence: number;
+  /** Optional NCBI API key: raises the E-utilities limit from 3 to 10 requests/second */
+  ncbiApiKey: string;
 }

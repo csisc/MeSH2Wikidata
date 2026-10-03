@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import {
   Check,
   X,
@@ -8,612 +8,438 @@ import {
   ExternalLink,
   CheckCheck,
   RotateCcw,
+  RefreshCw,
+  AlertTriangle,
 } from 'lucide-react';
 import {
-  BatchResponse,
   DatasetInfoResponse,
-  ProcessedRelationRecord,
+  LlmConfig,
   MeshEntityInfo,
-  WikidataVerification,
-  PubMedReference,
+  ProcessedRelationRecord,
 } from './types';
-import {
-  resolveMeshOffline,
-  inferWikidataPropertyOffline,
-  WIKIDATA_BIOMEDICAL_PROPERTIES,
-} from './data/biomedicalOntology';
+import { WIKIDATA_BIOMEDICAL_PROPERTIES } from './data/biomedicalOntology';
+import { classifyRuleBased, classifyWithOllama, loadConfig, saveConfig } from './lib/classifier';
+import { parseCsv, ParsedCsv, RawCsvRow } from './lib/csv';
+import { findExistingLinks, resolveMeshIds } from './lib/wikidata';
+import { findPubMedReference } from './lib/pubmed';
+import { canApprove, isExactDuplicate } from './lib/quickstatements';
 import { RelationInspector } from './components/RelationInspector';
 import { QuickStatementsModal } from './components/QuickStatementsModal';
 import { StorageAndLlmPanel } from './components/StorageAndLlmPanel';
 
 const MAX_BATCH_SIZE = 100;
 
-interface RawCsvRow {
-  rowIndex: number;
-  tupleRaw: string;
-  subjectMeshId: string;
-  objectMeshId: string;
-  pmi: number;
-}
-
-const DEFAULT_CSV_FALLBACK = `Tuple,PMI
+/** Only used when ./data/missing_rels.csv cannot be fetched (e.g. opened from file://). */
+const SAMPLE_CSV = `Tuple,PMI
 "('D009068', 'D000222')",2.55
 "('D009068', 'D001480')",2.09
-"('D009068', 'D001143')",2.36
-"('D009068', 'D022081')",2.15
-"('D009068', 'D004558')",2.09
-"('D009068', 'D008840')",2.31
-"('D009068', 'D045726')",2.01
-"('D009068', 'D035683')",2.67
-"('D009068', 'D012119')",2.10
-"('D009068', 'D011597')",3.57
-"('D009068', 'D000203')",2.4
-"('D009068', 'D009434')",2.14
-"('D009068', 'D015854')",2.13
-"('D009068', 'D009983')",2.03
-"('D009068', 'D008666')",2.14
-"('D009068', 'D008019')",3.58
-"('D009068', 'D010101')",3.35
-"('D009068', 'D002909')",2.31
-"('D009068', 'D003599')",2.28
-"('D009068', 'D011930')",2.73
-"('D009068', 'D001479')",2.4
-"('D009068', 'D020868')",2.1
-"('D009068', 'D002630')",2.80
-"('D009068', 'D012890')",2.29
-"('D009068', 'D020734')",2.33
-"('D009068', 'D011590')",2.03
-"('D009068', 'D009368')",2.18
-"('D009068', 'D015536')",2.24
-"('D009068', 'D009361')",3.57
-"('D009068', 'D001831')",2.27
-"('D009068', 'D020820')",2.17
-"('D009068', 'D006225')",2.69
-"('D009068', 'D001288')",2.36
-"('D009068', 'D005625')",2.70
-"('D009068', 'D020928')",2.03
-"('D009068', 'D009213')",3.43
-"('D009068', 'D020540')",2.02
-"('D009068', 'D006293')",2.91
-"('D009068', 'D004354')",2.11
-"('D009068', 'D004576')",3.44
-"('D009068', 'D001836')",2.4
-"('D009068', 'D012018')",2.82
-"('D009068', 'D002448')",3.44
-"('D009068', 'D018925')",2.72
-"('D009068', 'D004298')",2.41
-"('D009068', 'D008819')",2.55
-"('D009068', 'D010300')",2.27
-"('D009068', 'D004435')",2.08
-"('D009068', 'D011187')",3.40
-"('D009068', 'D042783')",2.78
-"('D009068', 'D012111')",2.04
-"('D009068', 'D066191')",2.70
-"('D009068', 'D002940')",2.3
-"('D009068', 'D007773')",2.29
-"('D009068', 'D004292')",2.58
-"('D009068', 'D003213')",3.08
-"('D009068', 'D034741')",2.53
-"('D009068', 'D007719')",2.91
-"('D009068', 'D010775')",2.64
-"('D009068', 'D042501')",2.14
-"('D009068', 'D005080')",4.13
-"('D009068', 'D016552')",4.12
-"('D009068', 'D003342')",2.7
-"('D009068', 'D016138')",5.79
-"('D009068', 'D008679')",2.05
-"('D009068', 'D008636')",2.41
-"('D009068', 'D007866')",2.83
-"('D009068', 'D042442')",2.13
-"('D009068', 'D020879')",2.15
-"('D009068', 'D001823')",3.11
-"('D009068', 'D013028')",2.51
-"('D009068', 'D005081')",4.7
-"('D009068', 'D054874')",4.7
-"('D009068', 'D004035')",2.21
-"('D009068', 'D012054')",2.13
-"('D009068', 'D006804')",2.76
-"('D009068', 'D020559')",2.47
-"('D009068', 'D000199')",2.59
-"('D009068', 'D016059')",3.33
-"('D009068', 'D007839')",2.7
-"('D009068', 'D020127')",2.85
-"('D009068', 'D042461')",2.15
-"('D009068', 'D007758')",2.0
-"('D009068', 'D018390')",2.44
-"('D009068', 'D009389')",2.25
-"('D009068', 'D005082')",3.39
-"('D009068', 'D016023')",2.87
-"('D009068', 'D004185')",2.13
-"('D009068', 'D034622')",2.5
-"('D009068', 'D009414')",2.03
-"('D009068', 'D013119')",2.55
-"('D009068', 'D018592')",2.23
-"('D009068', 'D002450')",2.15
-"('D009068', 'D051057')",2.75
-"('D009068', 'D020782')",2.91
-"('D009068', 'D005109')",2.27
-"('D009068', 'D008959')",2.05
-"('D009068', 'D002149')",2.5
-"('D009068', 'D005133')",5.11
-"('D009068', 'D019869')",2.43
 "('D010781', 'D012680')",2.78
-"('D010781', 'D003949')",2.24
 "('D010781', 'D007089')",5.79
-"('D010781', 'D020763')",2.00
-"('D010781', 'D019060')",2.22
-"('D010781', 'D007090')",5.72
-"('D010781', 'D048088')",2.27
-"('D010781', 'D001847')",2.05
-"('D010781', 'D008279')",3.67
-"('D010781', 'D001158')",2.28
-"('D010781', 'D008490')",2.46
-"('D010781', 'D014056')",5.70
-"('D010781', 'D014057')",5.72
-"('D010781', 'D008491')",2.49
-"('D010781', 'D011856')",5.79
-"('D010781', 'D014463')",2.67
-"('D010781', 'D003937')",2.77
-"('D010781', 'D015203')",2.53
-"('D010781', 'D003943')",2.21
-"('D010781', 'D000465')",2.45
-"('D010781', 'D002561')",2.53
-"('D010781', 'D007554')",2.08
-"('D010781', 'D004724')",2.1
-"('D010781', 'D013048')",2.09
-"('D010781', 'D006470')",2.16
-"('D010781', 'D012142')",2.45
-"('D010781', 'D013899')",2.56
-"('D010781', 'D003581')",2.20
-"('D010781', 'D003947')",4.61
-"('D010781', 'D001706')",2.33
-"('D010781', 'D011868')",2.49
-"('D010781', 'D014656')",2.13
-"('D010781', 'D008175')",2.47
-"('D010781', 'D007202')",2.98
-"('D010781', 'D000792')",3.79
-"('D010781', 'D001157')",2.18
-"('D010781', 'D001775')",2.20
-"('D010781', 'D018204')",2.18
-"('D010781', 'D007091')",4.56
-"('D010781', 'D009423')",2.50
-"('D010781', 'D014680')",2.33
-"('D010781', 'D020196')",2.1
-"('D010781', 'D011877')",5.06
-"('D010781', 'D003327')",2.12
-"('D010781', 'D057791')",2.95
-"('D010781', 'D060726')",2.21
-"('D010781', 'D011237')",2.51
-"('D010781', 'D064907')",4.10
-"('D010781', 'D012886')",2.7
-"('D010781', 'D019635')",2.03
 "('D007963', 'D008815')",3.32
-"('D007963', 'D004847')",2.20
-"('D007963', 'D023421')",2.09
-"('D007963', 'D004268')",2.04
-"('D007963', 'D004195')",2.0
-"('D007963', 'D008214')",5.80
-"('D007963', 'D003239')",2.58
-"('D007963', 'D001327')",2.42
-"('D007963', 'D000954')",3.90
-"('D007963', 'D010783')",2.33
-"('D007963', 'D048708')",2.40
-"('D007963', 'D001790')",2.74
-"('D007963', 'D049109')",2.41
-"('D007963', 'D007159')",4.06
-"('D007963', 'D008206')",2.74
-"('D007963', 'D007109')",4.5
-"('D007963', 'D011971')",4.18
-"('D007963', 'D008232')",2.98
-"('D007963', 'D022423')",4.01
-"('D007963', 'D056747')",3.7
-"('D007963', 'D016923')",2.16
-"('D007963', 'D006967')",2.01
-"('D007963', 'D007153')",2.5
-"('D007963', 'D013601')",5.80
-"('D007963', 'D006001')",2.04
-"('D007963', 'D002454')",2.8
-"('D007963', 'D002453')",2.24
-"('D007963', 'D007160')",3.06
-"('D007963', 'D015229')",2.08
-"('D007963', 'D011994')",2.17
-"('D007963', 'D008810')",3.35
-"('D007963', 'D007167')",3.52
-"('D007963', 'D014764')",2.48
-"('D007963', 'D017209')",2.21
-"('D007963', 'D010586')",4.16
-"('D007963', 'D016180')",2.25
-"('D007963', 'D064987')",2.05
-"('D007963', 'D015658')",2.17
-"('D007963', 'D004267')",2.29
-"('D007963', 'D008817')",2.83
-"('D007963', 'D030801')",3.00
-"('D007963', 'D008208')",3.88
-"('D007963', 'D012157')",4.51
-"('D007963', 'D014612')",2.5
-"('D007963', 'D000911')",2.97
-"('D007963', 'D008163')",3.2
-"('D007963', 'D007378')",4.1
-"('D007963', 'D006403')",3.11
-"('D007963', 'D008822')",3.1
-"('D007963', 'D008221')",3.9
-"('D008815', 'D004847')",2.6
-"('D008815', 'D023421')",3.60
-"('D008815', 'D004268')",2.55
-"('D008815', 'D007150')",2.09
-"('D008815', 'D011494')",2.28
-"('D008815', 'D004195')",3.66
-"('D008815', 'D045744')",2.42
-"('D008815', 'D008214')",3.44
-"('D008815', 'D003239')",2.90
-"('D008815', 'D000954')",2.70
-"('D008815', 'D009363')",2.17
-"('D008815', 'D007118')",2.14
-"('D008815', 'D009687')",2.33
-"('D008815', 'D008099')",2.12
-"('D008815', 'D048708')",2.70
-"('D008815', 'D049109')",2.69
-"('D008815', 'D007159')",2.42
-"('D008815', 'D012333')",2.22
-"('D008815', 'D007109')",3.22
-"('D008815', 'D011971')",3.12
-"('D008815', 'D018836')",2.09
-"('D008815', 'D007249')",2.16
-"('D008815', 'D014118')",2.28
-"('D008815', 'D022423')",3.08
-"('D008815', 'D056747')",2.88
-"('D008815', 'D016923')",2.69
-"('D008815', 'D017346')",2.44
-"('D008815', 'D013601')",3.72
-"('D008815', 'D043562')",2.23
-"('D008815', 'D006001')",2.4
 "('D004333', 'D000577')",2.16
-"('D004333', 'D002491')",2.30
-"('D004333', 'D000470')",2.29
-"('D004333', 'D012107')",2.31
-"('D004333', 'D011084')",2.15
-"('D004333', 'D004305')",2.82
-"('D004333', 'D011278')",2.45
-"('D004333', 'D006967')",2.04
-"('D004333', 'D004304')",2.94
-"('D004333', 'D009479')",2.00
-"('D004333', 'D004359')",2.23
-"('D004333', 'D018373')",2.97
-"('D004333', 'D017207')",2.34
-"('D004333', 'D010599')",3.10
-"('D004333', 'D018377')",2.2
-"('D004333', 'D000305')",2.60
-"('D004333', 'D012898')",2.03
-"('D004333', 'D007267')",5.79
-"('D004333', 'D006576')",2.11
-"('D004333', 'D007093')",2.02
-"('D004333', 'D000605')",2.29
-"('D004333', 'D002317')",2.26
-"('D004333', 'D002492')",2.56
-"('D004333', 'D017208')",2.25
-"('D004333', 'D006969')",2.32
-"('D004333', 'D018689')",2.91
-"('D004333', 'D000760')",2.24
-"('D004333', 'D012867')",2.00
-"('D004333', 'D008173')",2.11
-"('D004333', 'D011283')",2.0
-"('D009017', 'D006306')",2.99
-"('D009017', 'D003141')",2.31
-"('D009017', 'D000367')",2.4
-"('D009017', 'D005202')",2.58
-"('D009017', 'D062312')",2.39
-"('D009017', 'D012959')",2.24
-"('D009017', 'D003430')",3.35
-"('D009017', 'D012044')",2.5
-"('D009017', 'D015233')",2.5
-"('D009017', 'D006262')",2.14
-"('D009017', 'D009748')",2.18
-"('D009017', 'D009026')",2.49
-"('D009017', 'D012749')",2.33
-"('D009017', 'D007153')",2.16
-"('D009017', 'D010272')",2.05
-"('D009017', 'D012308')",2.88
-"('D009017', 'D015229')",2.36
-"('D009017', 'D015995')",5.80
-"('D009017', 'D006305')",2.53
-"('D009017', 'D001211')",2.82
 `;
 
-function parseCsv(raw: string): RawCsvRow[] {
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+const pendingEntity = (meshId: string): MeshEntityInfo => ({
+  meshId,
+  qid: null,
+  label: meshId,
+  description: 'Resolving through Wikidata...',
+  semanticGroup: null,
+  treeNumbers: [],
+  resolution: 'pending',
+});
 
-  const rows: RawCsvRow[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (i === 0 && line.toLowerCase().startsWith('tuple')) {
-      continue;
-    }
-    const match = line.match(/\(\s*'([A-Z0-9]+)'\s*,\s*'([A-Z0-9]+)'\s*\)"?\s*,\s*([0-9.]+)/i);
-    if (match) {
-      const subjectMeshId = match[1].trim();
-      const objectMeshId = match[2].trim();
-      const pmi = parseFloat(match[3]);
-      if (!isNaN(pmi)) {
-        rows.push({
-          rowIndex: rows.length + 1,
-          tupleRaw: `('${subjectMeshId}', '${objectMeshId}')`,
-          subjectMeshId,
-          objectMeshId,
-          pmi,
-        });
-      }
-    }
+const isResolved = (e: MeshEntityInfo) => e.resolution === 'resolved' || e.resolution === 'ambiguous';
+const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError';
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const keyOf = (r: RawCsvRow) => `${r.subjectMeshId}_${r.objectMeshId}`;
+
+function QidLink({ entity }: { entity: MeshEntityInfo }) {
+  if (entity.qid) {
+    return (
+      <a
+        href={`https://www.wikidata.org/wiki/${entity.qid}`}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        className="text-blue-600 hover:underline"
+        title={entity.resolution === 'ambiguous' ? `Several items share this MeSH ID: ${(entity.candidateQids ?? []).join(', ')}` : undefined}
+      >
+        {entity.qid}
+        {entity.resolution === 'ambiguous' ? ' ⚠' : ''}
+      </a>
+    );
   }
-  return rows;
+  const text: Record<string, string> = {
+    pending: 'resolving…',
+    'not-found': 'no Wikidata item',
+    qualifier: 'qualifier, not a descriptor',
+    error: 'lookup failed',
+  };
+  return <span className="text-rose-700">{text[entity.resolution] ?? 'unresolved'}</span>;
+}
+
+interface PipelineState {
+  label: string;
+  done: number;
+  total: number;
 }
 
 export default function App() {
   const [activeNav, setActiveNav] = useState<'queue' | 'storage' | 'llm'>('queue');
   const [exportModalOpen, setExportModalOpen] = useState(false);
 
-  const [rawCsvString, setRawCsvString] = useState(DEFAULT_CSV_FALLBACK);
-  const [parsedRows, setParsedRows] = useState<RawCsvRow[]>(() => parseCsv(DEFAULT_CSV_FALLBACK));
+  const [rawCsvString, setRawCsvString] = useState('');
+  const [parsed, setParsed] = useState<ParsedCsv>(() => parseCsv(SAMPLE_CSV));
+  const [csvSource, setCsvSource] = useState<'sample' | 'bundled' | 'upload'>('sample');
   const [currentBatchIndex, setCurrentBatchIndex] = useState(0);
-  const [loadingBatch, setLoadingBatch] = useState(false);
+  const [csvLoading, setCsvLoading] = useState(true);
 
-  // Stored relations across all viewed batches (cache)
-  const [processedRelations, setProcessedRelations] = useState<Map<string, ProcessedRelationRecord>>(
-    new Map()
-  );
+  const [config, setConfigState] = useState<LlmConfig>(() => loadConfig());
+  const configRef = useRef(config);
+  const updateConfig = useCallback((cfg: LlmConfig) => {
+    configRef.current = cfg;
+    setConfigState(cfg);
+    saveConfig(cfg);
+  }, []);
 
-  // Filters & selection
+  // The ref is the source of truth (async pipeline code reads it between awaits);
+  // React state only mirrors it for rendering.
+  const recordsRef = useRef<Map<string, ProcessedRelationRecord>>(new Map());
+  const [processedRelations, setProcessedRelations] = useState<Map<string, ProcessedRelationRecord>>(recordsRef.current);
+  const commit = useCallback((fn: (m: Map<string, ProcessedRelationRecord>) => void) => {
+    const copy = new Map(recordsRef.current);
+    fn(copy);
+    recordsRef.current = copy;
+    setProcessedRelations(copy);
+  }, []);
+  const meshCache = useRef(new Map<string, MeshEntityInfo>());
+
+  const [pipeline, setPipeline] = useState<PipelineState | null>(null);
+  const [pipelineErrors, setPipelineErrors] = useState<string[]>([]);
+  const runRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
   const [hideDuplicates, setHideDuplicates] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRelationId, setSelectedRelationId] = useState<string | null>(null);
 
-  // Try loading /public/data/missing_rels.csv or /data/missing_rels.csv on mount
+  const rows = parsed.rows;
+
+  // Load the bundled CSV once (it is served as a static file next to the app).
   useEffect(() => {
+    let cancelled = false;
     fetch('./data/missing_rels.csv')
       .then((res) => {
-        if (res.ok) return res.text();
-        throw new Error('Not found');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.text();
       })
       .then((text) => {
-        if (text && text.trim().length > 20) {
+        if (cancelled) return;
+        const p = parseCsv(text);
+        if (p.rows.length > 0) {
           setRawCsvString(text);
-          const parsed = parseCsv(text);
-          setParsedRows(parsed);
+          setParsed(p);
+          setCsvSource('bundled');
         }
       })
       .catch(() => {
-        // Fallback already set
-      });
+        if (!cancelled) setPipelineErrors(['Could not load ./data/missing_rels.csv; showing a 6-row sample. Upload your CSV on the Pipeline Storage tab.']);
+      })
+      .finally(() => !cancelled && setCsvLoading(false));
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Process the active 100-relation batch client-side
-  const processBatch = useCallback(
-    (batchIdx: number, rows: RawCsvRow[]) => {
-      setLoadingBatch(true);
-      const startIdx = batchIdx * MAX_BATCH_SIZE;
-      const endIdx = Math.min(startIdx + MAX_BATCH_SIZE, rows.length);
-      const batchSlice = rows.slice(startIdx, endIdx);
-
-      const updatedMap = new Map(processedRelations);
-      for (const row of batchSlice) {
-        const key = `${row.subjectMeshId}_${row.objectMeshId}`;
-        if (!updatedMap.has(key)) {
-          const subject: MeshEntityInfo = resolveMeshOffline(row.subjectMeshId);
-          const object: MeshEntityInfo = resolveMeshOffline(row.objectMeshId);
-
-          const llmPrediction = inferWikidataPropertyOffline(subject, object, row.pmi);
-
-          // Deterministic duplicate check simulation (so curators can see both novel and existing duplicate states)
-          const isDuplicate = row.rowIndex % 9 === 0;
-          const wikidataVerification: WikidataVerification = isDuplicate
-            ? {
-                existsInWikidata: true,
-                existingPropertyId: llmPrediction.recommendedProperty.pid,
-                existingPropertyLabel: llmPrediction.recommendedProperty.label,
-                checkedAt: new Date().toISOString(),
-                sparqlEndpoint: 'https://query.wikidata.org/sparql',
-                verificationMode: 'local-kg-index',
-              }
-            : {
-                existsInWikidata: false,
-                checkedAt: new Date().toISOString(),
-                sparqlEndpoint: 'https://query.wikidata.org/sparql',
-                verificationMode: 'local-kg-index',
-              };
-
-          const sNum = parseInt(row.subjectMeshId.replace(/\D/g, ''), 10) || 9068;
-          const oNum = parseInt(row.objectMeshId.replace(/\D/g, ''), 10) || 222;
-          const pmid = String(28000000 + ((sNum * 131 + oNum * 97 + row.rowIndex * 17) % 10900000));
-          const pubmedReference: PubMedReference = {
-            pmid,
-            title: `Clinical and molecular association between ${subject.label} and ${object.label}: quantitative co-occurrence analysis (PMI=${row.pmi.toFixed(2)})`,
-            journal: 'Journal of Clinical Investigation',
-            pubDate: '2023 Dec',
-            authors: 'Chen L, Rossi M, Takahashi K et al.',
-            queryUsed: `"${subject.label}"[MeSH Terms] AND "${object.label}"[MeSH Terms]`,
-            source: 'pubmed-indexed-cache',
-          };
-
-          const record: ProcessedRelationRecord = {
-            id: key,
-            rowIndex: row.rowIndex,
-            tupleRaw: row.tupleRaw,
-            subjectMeshId: row.subjectMeshId,
-            objectMeshId: row.objectMeshId,
-            pmi: row.pmi,
-            subject,
-            object,
-            selectedProperty: llmPrediction.recommendedProperty,
-            llmPrediction,
-            wikidataVerification,
-            pubmedReference,
-            status: 'pending',
-            updatedAt: new Date().toISOString(),
-          };
-
-          updatedMap.set(key, record);
-        }
-      }
-
-      setProcessedRelations(updatedMap);
-      setCurrentBatchIndex(batchIdx);
-      setLoadingBatch(false);
-
-      if (batchSlice.length > 0) {
-        const firstKey = `${batchSlice[0].subjectMeshId}_${batchSlice[0].objectMeshId}`;
-        setSelectedRelationId((prev) =>
-          prev && batchSlice.some((r) => `${r.subjectMeshId}_${r.objectMeshId}` === prev)
-            ? prev
-            : firstKey
-        );
-      }
+  const patch = useCallback(
+    (id: string, fn: (r: ProcessedRelationRecord) => ProcessedRelationRecord) => {
+      if (!recordsRef.current.has(id)) return;
+      commit((m) => m.set(id, fn(m.get(id)!)));
     },
-    [processedRelations]
+    [commit]
   );
 
-  useEffect(() => {
-    if (parsedRows.length > 0) {
-      processBatch(currentBatchIndex, parsedRows);
-    }
-  }, [currentBatchIndex, parsedRows, processBatch]);
-
-  // Current batch items
-  const currentBatchRelations = useMemo(() => {
-    const startIdx = currentBatchIndex * MAX_BATCH_SIZE;
-    const endIdx = Math.min(startIdx + MAX_BATCH_SIZE, parsedRows.length);
-    const slice = parsedRows.slice(startIdx, endIdx);
-    return slice
-      .map((r) => processedRelations.get(`${r.subjectMeshId}_${r.objectMeshId}`))
-      .filter((r): r is ProcessedRelationRecord => !!r);
-  }, [currentBatchIndex, parsedRows, processedRelations]);
-
-  const totalBatches = Math.max(1, Math.ceil(parsedRows.length / MAX_BATCH_SIZE));
-
-  // Single-click Approve / Reject handler
-  const handleDecision = useCallback(
-    (id: string, status: 'approved' | 'rejected' | 'pending') => {
-      setProcessedRelations((prev) => {
-        const copy = new Map(prev);
-        const item = copy.get(id);
-        if (item) {
-          copy.set(id, { ...item, status, updatedAt: new Date().toISOString() });
-        }
-        return copy;
-      });
-    },
-    []
-  );
-
-  // Property override
-  const handlePropertyChange = useCallback((id: string, pid: string) => {
-    const prop = WIKIDATA_BIOMEDICAL_PROPERTIES.find((p) => p.pid === pid);
-    if (!prop) return;
-    setProcessedRelations((prev) => {
-      const copy = new Map(prev);
-      const item = copy.get(id);
-      if (item) {
-        copy.set(id, { ...item, selectedProperty: prop, updatedAt: new Date().toISOString() });
-      }
-      return copy;
-    });
+  const makeRecord = useCallback((row: RawCsvRow): ProcessedRelationRecord => {
+    const subject = meshCache.current.get(row.subjectMeshId) ?? pendingEntity(row.subjectMeshId);
+    const object = meshCache.current.get(row.objectMeshId) ?? pendingEntity(row.objectMeshId);
+    const prediction = classifyRuleBased(subject, object, row.pmi);
+    const unresolved = (e: MeshEntityInfo) => e.resolution !== 'pending' && !e.qid;
+    return {
+      id: keyOf(row),
+      rowIndex: row.rowIndex,
+      tupleRaw: row.tupleRaw,
+      subjectMeshId: row.subjectMeshId,
+      objectMeshId: row.objectMeshId,
+      pmi: row.pmi,
+      subject,
+      object,
+      selectedProperty: prediction.recommendedProperty,
+      llmPrediction: prediction,
+      wikidataVerification: { state: unresolved(subject) || unresolved(object) ? 'skipped' : 'pending', existing: [] },
+      pubmedReference: null,
+      pubmedState: 'idle',
+      status: 'pending',
+      updatedAt: new Date().toISOString(),
+    };
   }, []);
 
-  // PubMed live refresh
-  const handleRefreshPubMed = useCallback(
-    async (id: string) => {
-      const item = processedRelations.get(id);
-      if (!item) return;
+  /**
+   * Real enrichment pipeline for one batch of <=100 rows:
+   *  1. one SPARQL query maps all MeSH descriptor IDs to Wikidata items (P486)
+   *  2. one SPARQL query finds existing statements between each resolved pair
+   *  3. optional local LLM (Ollama) picks the property, row by row
+   *  4. PubMed E-utilities search finds a reference, row by row (rate limited)
+   */
+  const loadBatch = useCallback(
+    async (batchIdx: number, allRows: RawCsvRow[], force = false) => {
+      const runId = ++runRef.current;
+      abortRef.current?.abort();
+      const ac = new AbortController();
+      abortRef.current = ac;
+      const stale = () => runRef.current !== runId || ac.signal.aborted;
 
-      const sClean = item.subject.label.replace(/\s*\([A-Z0-9]+\)$/, '');
-      const oClean = item.object.label.replace(/\s*\([A-Z0-9]+\)$/, '');
-      const queryUsed = `"${sClean}"[MeSH Terms] AND "${oClean}"[MeSH Terms]`;
+      const slice = allRows.slice(batchIdx * MAX_BATCH_SIZE, (batchIdx + 1) * MAX_BATCH_SIZE);
+      if (slice.length === 0) return;
+      setPipelineErrors((prev) => prev.filter((m) => m.startsWith('Could not load ./data')));
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2500);
+      // Drop failed lookups from the cache when the curator asks for a re-run.
+      if (force) {
+        for (const [id, e] of meshCache.current) if (e.resolution === 'error') meshCache.current.delete(id);
+      }
+
+      commit((copy) => {
+        for (const r of slice) {
+          const existing = copy.get(keyOf(r));
+          if (!existing || (force && existing.status === 'pending' && !isResolved(existing.subject) && !isResolved(existing.object))) {
+            copy.set(keyOf(r), existing ? { ...makeRecord(r), status: existing.status } : makeRecord(r));
+          }
+        }
+      });
+      setSelectedRelationId((prev) => (prev && slice.some((r) => keyOf(r) === prev) ? prev : keyOf(slice[0])));
+
+      const errors: string[] = [];
+      const fail = (m: string) => {
+        errors.push(m);
+        setPipelineErrors((prev) => [...prev.filter((x) => x !== m), m]);
+      };
 
       try {
-        const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(
-          queryUsed
-        )}&retmax=1&retmode=json&sort=relevance`;
-        const searchRes = await fetch(searchUrl, { signal: controller.signal });
-        if (searchRes.ok) {
-          const searchData = await searchRes.json();
-          const idList: string[] = searchData?.esearchresult?.idlist || [];
-          if (idList.length > 0) {
-            const pmid = idList[0];
-            const sumUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=${pmid}&retmode=json`;
-            const sumRes = await fetch(sumUrl, { signal: controller.signal });
-            clearTimeout(timeout);
-            if (sumRes.ok) {
-              const sumData = await sumRes.json();
-              const doc = sumData?.result?.[pmid];
-              if (doc && doc.title) {
-                const authors =
-                  Array.isArray(doc.authors) && doc.authors.length > 0
-                    ? `${doc.authors.slice(0, 3).map((a: any) => a.name).join(', ')}${
-                        doc.authors.length > 3 ? ' et al.' : ''
-                      }`
-                    : 'Biomedical Consortium';
-                setProcessedRelations((prev) => {
-                  const copy = new Map(prev);
-                  copy.set(id, {
-                    ...item,
-                    pubmedReference: {
-                      pmid,
-                      title: String(doc.title).replace(/\.$/, ''),
-                      journal: doc.fulljournalname || doc.source || 'PubMed Indexed Journal',
-                      pubDate: doc.pubdate || '2024',
-                      authors,
-                      queryUsed,
-                      source: 'ncbi-eutils-live',
-                    },
-                  });
-                  return copy;
-                });
-                return;
-              }
+        // 1. MeSH -> Wikidata -------------------------------------------------
+        const need = Array.from(
+          new Set(slice.flatMap((r) => [r.subjectMeshId, r.objectMeshId]).filter((id) => !meshCache.current.has(id)))
+        );
+        if (need.length > 0) {
+          setPipeline({ label: `Resolving ${need.length} MeSH descriptors through Wikidata (P486)`, done: 0, total: 1 });
+          try {
+            const resolved = await resolveMeshIds(need, ac.signal);
+            if (stale()) return;
+            for (const [id, e] of resolved) meshCache.current.set(id, e);
+          } catch (e) {
+            if (isAbort(e) || stale()) return;
+            fail(`MeSH to Wikidata lookup failed: ${errMsg(e)}. Use "Re-run checks" to retry.`);
+            for (const id of need) {
+              meshCache.current.set(id, { ...pendingEntity(id), resolution: 'error', description: `Lookup failed: ${errMsg(e)}` });
             }
           }
         }
-        clearTimeout(timeout);
-      } catch {
-        clearTimeout(timeout);
+        commit((copy) => {
+          for (const r of slice) {
+            const rec = copy.get(keyOf(r));
+            if (!rec) continue;
+            const subject = meshCache.current.get(r.subjectMeshId) ?? rec.subject;
+            const object = meshCache.current.get(r.objectMeshId) ?? rec.object;
+            if (rec.subject === subject && rec.object === object) continue;
+            const prediction = classifyRuleBased(subject, object, rec.pmi);
+            const keepProperty = rec.selectedProperty.pid !== rec.llmPrediction.recommendedProperty.pid;
+            const bad = (e: MeshEntityInfo) => e.resolution !== 'pending' && !e.qid;
+            copy.set(rec.id, {
+              ...rec,
+              subject,
+              object,
+              llmPrediction: prediction,
+              selectedProperty: keepProperty ? rec.selectedProperty : prediction.recommendedProperty,
+              wikidataVerification:
+                bad(subject) || bad(object)
+                  ? { state: 'skipped', existing: [] }
+                  : rec.wikidataVerification.state === 'checked'
+                  ? rec.wikidataVerification
+                  : { state: 'pending', existing: [] },
+            });
+          }
+        });
+
+        // 2. Existing statements ---------------------------------------------
+        const toCheck = slice
+          .map((r) => recordsRef.current.get(keyOf(r)))
+          .filter((r): r is ProcessedRelationRecord => !!r && !!r.subject.qid && !!r.object.qid && r.wikidataVerification.state !== 'checked');
+        if (toCheck.length > 0) {
+          setPipeline({ label: `Checking ${toCheck.length} pairs for existing Wikidata statements`, done: 0, total: 1 });
+          try {
+            const links = await findExistingLinks(
+              toCheck.map((r) => ({ key: r.id, subjectQid: r.subject.qid!, objectQid: r.object.qid! })),
+              ac.signal
+            );
+            if (stale()) return;
+            const checkedAt = new Date().toISOString();
+            commit((copy) => {
+              for (const r of toCheck) {
+                const rec = copy.get(r.id);
+                if (rec) copy.set(r.id, { ...rec, wikidataVerification: { state: 'checked', existing: links.get(r.id) ?? [], checkedAt } });
+              }
+            });
+          } catch (e) {
+            if (isAbort(e) || stale()) return;
+            fail(`Wikidata duplicate check failed: ${errMsg(e)}. Rows stay unchecked; use "Re-run checks" to retry.`);
+            commit((copy) => {
+              for (const r of toCheck) {
+                const rec = copy.get(r.id);
+                if (rec) copy.set(r.id, { ...rec, wikidataVerification: { state: 'error', existing: [], error: errMsg(e) } });
+              }
+            });
+          }
+        }
+
+        // 3. Optional local LLM ------------------------------------------------
+        const cfg = configRef.current;
+        if (cfg.mode === 'ollama') {
+          const todo = slice
+            .map((r) => recordsRef.current.get(keyOf(r)))
+            .filter((r): r is ProcessedRelationRecord => !!r && r.llmPrediction.engine === 'rule-based' && r.status === 'pending' && isResolved(r.subject) && isResolved(r.object));
+          for (let i = 0; i < todo.length; i++) {
+            if (stale()) return;
+            setPipeline({ label: `Asking ${cfg.ollamaModel} to choose properties`, done: i, total: todo.length });
+            const rec = todo[i];
+            try {
+              const pred = await classifyWithOllama(cfg, rec.subject, rec.object, rec.pmi, ac.signal);
+              if (stale()) return;
+              patch(rec.id, (cur) => ({
+                ...cur,
+                llmPrediction: pred,
+                selectedProperty: cur.selectedProperty.pid === cur.llmPrediction.recommendedProperty.pid ? pred.recommendedProperty : cur.selectedProperty,
+              }));
+            } catch (e) {
+              if (isAbort(e) || stale()) return;
+              fail(`Local model unavailable (${errMsg(e)}). Falling back to the rule-based scorer for this batch. Is Ollama running with OLLAMA_ORIGINS set for this site?`);
+              break;
+            }
+          }
+        }
+
+        // 4. PubMed references ---------------------------------------------------
+        const refRows = slice
+          .map((r) => recordsRef.current.get(keyOf(r)))
+          .filter((r): r is ProcessedRelationRecord => !!r && isResolved(r.subject) && isResolved(r.object) && (r.pubmedState === 'idle' || (force && r.pubmedState === 'error')));
+        for (let i = 0; i < refRows.length; i++) {
+          if (stale()) return;
+          setPipeline({ label: 'Searching PubMed for references', done: i, total: refRows.length });
+          const rec = recordsRef.current.get(refRows[i].id) ?? refRows[i];
+          patch(rec.id, (c) => ({ ...c, pubmedState: 'loading' }));
+          try {
+            const ref = await findPubMedReference({
+              subjectLabel: rec.subject.label,
+              objectLabel: rec.object.label,
+              pid: rec.selectedProperty.pid,
+              apiKey: configRef.current.ncbiApiKey,
+              signal: ac.signal,
+            });
+            if (stale()) return;
+            patch(rec.id, (c) => ({ ...c, pubmedReference: ref, pubmedState: ref ? 'found' : 'none', pubmedError: undefined }));
+          } catch (e) {
+            if (isAbort(e) || stale()) return;
+            patch(rec.id, (c) => ({ ...c, pubmedState: 'error', pubmedError: errMsg(e) }));
+            fail(`PubMed search error: ${errMsg(e)}`);
+            if (/429/.test(errMsg(e))) break;
+          }
+        }
+      } finally {
+        if (runRef.current === runId) setPipeline(null);
       }
     },
-    [processedRelations]
+    [makeRecord, patch, commit]
   );
 
-  // Bulk actions in current batch
-  const handleBulkDecision = (status: 'approved' | 'pending', excludeDuplicates: boolean) => {
-    setProcessedRelations((prev) => {
-      const copy = new Map(prev);
+  useEffect(() => {
+    if (!csvLoading && rows.length > 0) loadBatch(currentBatchIndex, rows);
+    return () => abortRef.current?.abort();
+  }, [currentBatchIndex, rows, csvLoading, loadBatch]);
+
+  const currentBatchRelations = useMemo(() => {
+    const slice = rows.slice(currentBatchIndex * MAX_BATCH_SIZE, (currentBatchIndex + 1) * MAX_BATCH_SIZE);
+    return slice.map((r) => processedRelations.get(keyOf(r))).filter((r): r is ProcessedRelationRecord => !!r);
+  }, [currentBatchIndex, rows, processedRelations]);
+
+  const totalBatches = Math.max(1, Math.ceil(rows.length / MAX_BATCH_SIZE));
+  const loadingBatch = csvLoading;
+
+  const handleDecision = useCallback(
+    (id: string, status: 'approved' | 'rejected' | 'pending') => {
+      patch(id, (item) => (status === 'approved' && !canApprove(item) ? item : { ...item, status, updatedAt: new Date().toISOString() }));
+    },
+    [patch]
+  );
+
+  const handlePropertyChange = useCallback(
+    (id: string, pid: string) => {
+      const prop = WIKIDATA_BIOMEDICAL_PROPERTIES.find((p) => p.pid === pid);
+      if (!prop) return;
+      patch(id, (item) => ({ ...item, selectedProperty: prop, updatedAt: new Date().toISOString() }));
+    },
+    [patch]
+  );
+
+  // Manual PubMed refresh for one row, using the property currently selected.
+  const handleRefreshPubMed = useCallback(
+    async (id: string) => {
+      const item = recordsRef.current.get(id);
+      if (!item) return;
+      patch(id, (c) => ({ ...c, pubmedState: 'loading', pubmedError: undefined }));
+      try {
+        const ref = await findPubMedReference({
+          subjectLabel: item.subject.label,
+          objectLabel: item.object.label,
+          pid: item.selectedProperty.pid,
+          apiKey: configRef.current.ncbiApiKey,
+        });
+        patch(id, (c) => ({ ...c, pubmedReference: ref, pubmedState: ref ? 'found' : 'none' }));
+      } catch (e) {
+        patch(id, (c) => ({ ...c, pubmedState: 'error', pubmedError: errMsg(e) }));
+      }
+    },
+    [patch]
+  );
+
+  const handleBulkDecision = (status: 'approved' | 'pending') => {
+    commit((copy) => {
       for (const rel of currentBatchRelations) {
-        if (excludeDuplicates && rel.wikidataVerification.existsInWikidata && status === 'approved') {
-          continue;
+        if (status === 'approved') {
+          if (rel.status !== 'pending') continue;
+          if (!canApprove(rel) || isExactDuplicate(rel)) continue;
+          if (rel.wikidataVerification.state !== 'checked') continue;
+          if (rel.llmPrediction.confidence < configRef.current.minConfidence) continue;
         }
         copy.set(rel.id, { ...rel, status, updatedAt: new Date().toISOString() });
       }
-      return copy;
     });
   };
 
   const handleUploadCsv = async (csvContent: string) => {
+    const p = parseCsv(csvContent);
+    if (p.rows.length === 0) throw new Error('No valid "(\'D…\', \'D…\')",PMI rows found in the CSV.');
     setRawCsvString(csvContent);
-    const parsed = parseCsv(csvContent);
-    setParsedRows(parsed);
-    setProcessedRelations(new Map());
+    setParsed(p);
+    setCsvSource('upload');
+    commit((m) => m.clear());
     setCurrentBatchIndex(0);
-    processBatch(0, parsed);
   };
 
-  // Filtered relations
+  const handleRerun = () => loadBatch(currentBatchIndex, rows, true);
+
   const filteredRelations = useMemo(() => {
     return currentBatchRelations.filter((r) => {
       if (statusFilter !== 'all' && r.status !== statusFilter) return false;
-      if (hideDuplicates && r.wikidataVerification.existsInWikidata) return false;
+      if (hideDuplicates && isExactDuplicate(r)) return false;
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
         const match =
@@ -621,100 +447,75 @@ export default function App() {
           r.objectMeshId.toLowerCase().includes(q) ||
           r.subject.label.toLowerCase().includes(q) ||
           r.object.label.toLowerCase().includes(q) ||
-          r.subject.qid.toLowerCase().includes(q) ||
-          r.object.qid.toLowerCase().includes(q) ||
+          (r.subject.qid ?? '').toLowerCase().includes(q) ||
+          (r.object.qid ?? '').toLowerCase().includes(q) ||
           r.selectedProperty.pid.toLowerCase().includes(q) ||
           r.selectedProperty.label.toLowerCase().includes(q) ||
-          r.pubmedReference.pmid.includes(q);
+          (r.pubmedReference?.pmid ?? '').includes(q);
         if (!match) return false;
       }
       return true;
     });
   }, [currentBatchRelations, statusFilter, hideDuplicates, searchQuery]);
 
-  const selectedRelation: ProcessedRelationRecord | null = useMemo(() => {
-    if (!selectedRelationId) return null;
-    return processedRelations.get(selectedRelationId) || null;
-  }, [processedRelations, selectedRelationId]);
+  const selectedRelation: ProcessedRelationRecord | null = useMemo(
+    () => (selectedRelationId ? processedRelations.get(selectedRelationId) || null : null),
+    [processedRelations, selectedRelationId]
+  );
 
   const batchCounts = useMemo(() => {
-    let pending = 0;
-    let approved = 0;
-    let rejected = 0;
-    let duplicates = 0;
+    let pending = 0, approved = 0, rejected = 0, duplicates = 0, unresolved = 0;
     for (const r of currentBatchRelations) {
       if (r.status === 'pending') pending++;
       else if (r.status === 'approved') approved++;
-      else if (r.status === 'rejected') rejected++;
-      if (r.wikidataVerification.existsInWikidata) duplicates++;
+      else rejected++;
+      if (isExactDuplicate(r)) duplicates++;
+      if (!canApprove(r) && r.subject.resolution !== 'pending' && r.object.resolution !== 'pending') unresolved++;
     }
-    return { total: currentBatchRelations.length, pending, approved, rejected, duplicates };
+    return { total: currentBatchRelations.length, pending, approved, rejected, duplicates, unresolved };
   }, [currentBatchRelations]);
 
-  const allApprovedRelations = useMemo(() => {
-    return Array.from(processedRelations.values()).filter((r) => r.status === 'approved');
-  }, [processedRelations]);
+  const allApprovedRelations = useMemo(
+    () => Array.from(processedRelations.values()).filter((r) => r.status === 'approved'),
+    [processedRelations]
+  );
 
   const datasetInfo: DatasetInfoResponse = useMemo(() => {
-    let approvedCount = 0;
-    let rejectedCount = 0;
-    let pendingCount = 0;
-    let duplicateCount = 0;
+    let approvedCount = 0, rejectedCount = 0, pendingCount = 0, duplicateCount = 0;
     for (const r of processedRelations.values()) {
       if (r.status === 'approved') approvedCount++;
       else if (r.status === 'rejected') rejectedCount++;
       else pendingCount++;
-      if (r.wikidataVerification.existsInWikidata) duplicateCount++;
+      if (isExactDuplicate(r)) duplicateCount++;
     }
     return {
-      fileName: 'missing_rels.csv',
-      storagePath: '/data/missing_rels.csv',
-      totalRows: parsedRows.length,
+      fileName: csvSource === 'upload' ? 'uploaded CSV' : 'missing_rels.csv',
+      storagePath: csvSource === 'bundled' ? './data/missing_rels.csv' : csvSource === 'upload' ? '(browser memory)' : '(built-in 6-row sample)',
+      totalRows: rows.length,
+      skippedRows: parsed.skipped,
       maxBatchSize: MAX_BATCH_SIZE,
       totalBatches,
       processedTotal: processedRelations.size,
-      stats: {
-        approvedCount,
-        rejectedCount,
-        pendingCount,
-        duplicateCount,
-      },
+      stats: { approvedCount, rejectedCount, pendingCount, duplicateCount },
       availableProperties: WIKIDATA_BIOMEDICAL_PROPERTIES,
     };
-  }, [parsedRows.length, totalBatches, processedRelations]);
+  }, [rows.length, parsed.skipped, csvSource, totalBatches, processedRelations]);
 
-  // Keyboard navigation
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (
-        activeNav !== 'queue' ||
-        exportModalOpen ||
-        ['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement)?.tagName)
-      ) {
-        return;
-      }
+      if (activeNav !== 'queue' || exportModalOpen || ['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement)?.tagName)) return;
       if (!selectedRelation) return;
-
       if (e.key === 'a' || e.key === 'A') {
         e.preventDefault();
-        handleDecision(
-          selectedRelation.id,
-          selectedRelation.status === 'approved' ? 'pending' : 'approved'
-        );
+        handleDecision(selectedRelation.id, selectedRelation.status === 'approved' ? 'pending' : 'approved');
       } else if (e.key === 'r' || e.key === 'R') {
         e.preventDefault();
-        handleDecision(
-          selectedRelation.id,
-          selectedRelation.status === 'rejected' ? 'pending' : 'rejected'
-        );
+        handleDecision(selectedRelation.id, selectedRelation.status === 'rejected' ? 'pending' : 'rejected');
       } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
         const idx = filteredRelations.findIndex((item) => item.id === selectedRelation.id);
         if (idx !== -1) {
-          const nextIdx =
-            e.key === 'ArrowDown'
-              ? Math.min(filteredRelations.length - 1, idx + 1)
-              : Math.max(0, idx - 1);
+          const nextIdx = e.key === 'ArrowDown' ? Math.min(filteredRelations.length - 1, idx + 1) : Math.max(0, idx - 1);
           setSelectedRelationId(filteredRelations[nextIdx].id);
         }
       }
@@ -781,7 +582,7 @@ export default function App() {
                 : 'hover:text-slate-900'
             }`}
           >
-            Offline LLM Config
+            Property Classifier
           </a>
           <a
             href="#export"
@@ -816,6 +617,8 @@ export default function App() {
             onUploadCsv={handleUploadCsv}
             onReturnToQueue={() => setActiveNav('queue')}
             rawCsvString={rawCsvString}
+            config={config}
+            onConfigChange={updateConfig}
           />
         </main>
       ) : (
@@ -830,8 +633,8 @@ export default function App() {
               <span className="font-mono tabular-nums">
                 Batch {currentBatchIndex + 1} of {totalBatches} (Rows{' '}
                 {currentBatchIndex * MAX_BATCH_SIZE + 1}–
-                {Math.min((currentBatchIndex + 1) * MAX_BATCH_SIZE, parsedRows.length)} of{' '}
-                {parsedRows.length})
+                {Math.min((currentBatchIndex + 1) * MAX_BATCH_SIZE, rows.length)} of{' '}
+                {rows.length})
               </span>
               <span aria-hidden="true">·</span>
               <span className="text-blue-700 font-medium">
@@ -852,7 +655,7 @@ export default function App() {
               >
                 {Array.from({ length: totalBatches }).map((_, idx) => {
                   const start = idx * 100 + 1;
-                  const end = Math.min((idx + 1) * 100, parsedRows.length);
+                  const end = Math.min((idx + 1) * 100, rows.length);
                   return (
                     <option key={idx} value={idx}>
                       Batch {idx + 1} (Rows {start}–{end})
@@ -881,6 +684,29 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* Live pipeline status & errors */}
+          {(pipeline || pipelineErrors.length > 0 || batchCounts.unresolved > 0) && (
+            <div className="px-6 py-2 bg-white border-b border-slate-200 space-y-1 text-xs">
+              {pipeline && (
+                <p className="text-blue-700 font-medium tabular-nums">
+                  ⟳ {pipeline.label}
+                  {pipeline.total > 1 ? ` (${pipeline.done}/${pipeline.total})` : '…'}
+                </p>
+              )}
+              {pipelineErrors.map((m) => (
+                <p key={m} className="text-amber-800 flex items-start gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                  <span>{m}</span>
+                </p>
+              ))}
+              {batchCounts.unresolved > 0 && (
+                <p className="text-slate-600">
+                  {batchCounts.unresolved} row(s) in this batch have a MeSH ID without a Wikidata item (or a qualifier); they cannot be approved or exported.
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Filter & Single-Click Bulk Actions Bar */}
           <div className="bg-slate-100/80 border-b border-slate-200 px-6 py-2.5 flex flex-wrap items-center justify-between gap-3">
@@ -963,15 +789,25 @@ export default function App() {
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => handleBulkDecision('approved', true)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 rounded-md hover:bg-emerald-100 transition-colors whitespace-nowrap cursor-pointer"
+                onClick={handleRerun}
+                disabled={!!pipeline}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
+                title="Retry failed Wikidata, PubMed or local-model calls for this batch"
               >
-                <CheckCheck className="w-3.5 h-3.5" />
-                <span>Approve All Novel in Batch</span>
+                <RefreshCw className={`w-3.5 h-3.5 ${pipeline ? 'animate-spin' : ''}`} />
+                <span>Re-run checks</span>
               </button>
               <button
                 type="button"
-                onClick={() => handleBulkDecision('pending', false)}
+                onClick={() => handleBulkDecision('approved')}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-300 rounded-md hover:bg-emerald-100 transition-colors whitespace-nowrap cursor-pointer"
+              >
+                <CheckCheck className="w-3.5 h-3.5" />
+                <span>Approve novel ≥ {(config.minConfidence * 100).toFixed(0)}% confidence</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleBulkDecision('pending')}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors whitespace-nowrap cursor-pointer"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
@@ -1019,7 +855,7 @@ export default function App() {
                     <tr>
                       <th className="py-2.5 px-3 w-12 text-right font-mono">#</th>
                       <th className="py-2.5 px-3">Subject (MeSH → Wikidata)</th>
-                      <th className="py-2.5 px-3">Offline LLM Property</th>
+                      <th className="py-2.5 px-3">Property (classifier)</th>
                       <th className="py-2.5 px-3">Object (MeSH → Wikidata)</th>
                       <th className="py-2.5 px-3 text-right">PMI</th>
                       <th className="py-2.5 px-3">Wikidata Check</th>
@@ -1057,17 +893,9 @@ export default function App() {
                             <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
                               <span>{rel.subjectMeshId}</span>
                               <span aria-hidden="true"> → </span>
-                              <a
-                                href={`https://www.wikidata.org/wiki/${rel.subject.qid}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                onClick={(e) => e.stopPropagation()}
-                                className="text-blue-600 hover:underline"
-                              >
-                                {rel.subject.qid}
-                              </a>
+                              <QidLink entity={rel.subject} />
                               <span aria-hidden="true"> · </span>
-                              <span className="font-sans">{rel.subject.semanticGroup}</span>
+                              <span className="font-sans">{rel.subject.semanticGroup ?? 'unclassified'}</span>
                             </div>
                           </td>
 
@@ -1086,7 +914,7 @@ export default function App() {
                               ))}
                             </select>
                             <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
-                              LLM Conf {(rel.llmPrediction.confidence * 100).toFixed(0)}%
+                              {rel.llmPrediction.engine === 'ollama' ? 'LLM' : 'Rule'} score {(rel.llmPrediction.confidence * 100).toFixed(0)}%
                             </div>
                           </td>
 
@@ -1098,17 +926,9 @@ export default function App() {
                             <div className="text-[11px] text-slate-500 font-mono tabular-nums mt-0.5">
                               <span>{rel.objectMeshId}</span>
                               <span aria-hidden="true"> → </span>
-                              <a
-                                href={`https://www.wikidata.org/wiki/${rel.object.qid}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                onClick={(e) => e.stopPropagation()}
-                                className="text-blue-600 hover:underline"
-                              >
-                                {rel.object.qid}
-                              </a>
+                              <QidLink entity={rel.object} />
                               <span aria-hidden="true"> · </span>
-                              <span className="font-sans">{rel.object.semanticGroup}</span>
+                              <span className="font-sans">{rel.object.semanticGroup ?? 'unclassified'}</span>
                             </div>
                           </td>
 
@@ -1119,33 +939,51 @@ export default function App() {
 
                           {/* Wikidata Duplication Check */}
                           <td className="py-2.5 px-3 whitespace-nowrap">
-                            {rel.wikidataVerification.existsInWikidata ? (
+                            {rel.wikidataVerification.state === 'pending' ? (
+                              <span className="text-slate-500">… checking</span>
+                            ) : rel.wikidataVerification.state === 'error' ? (
+                              <span className="text-amber-700 font-medium" title={rel.wikidataVerification.error}>⚠ check failed</span>
+                            ) : rel.wikidataVerification.state === 'skipped' ? (
+                              <span className="text-slate-400">— unresolved</span>
+                            ) : isExactDuplicate(rel) ? (
+                              <span className="text-amber-700 font-medium" title="This exact statement already exists in Wikidata">
+                                ▲ Duplicate ({rel.selectedProperty.pid})
+                              </span>
+                            ) : rel.wikidataVerification.existing.length > 0 ? (
                               <span
-                                className="text-amber-700 font-medium"
-                                title={`Existing statement ${rel.wikidataVerification.existingPropertyId} (${rel.wikidataVerification.existingPropertyLabel})`}
+                                className="text-emerald-700 font-medium"
+                                title={rel.wikidataVerification.existing.map((e) => `${e.direction === 'reverse' ? 'reverse ' : ''}${e.pid} ${e.label}`).join('; ')}
                               >
-                                ▲ Duplicate ({rel.wikidataVerification.existingPropertyId})
+                                ● Novel · linked via {rel.wikidataVerification.existing[0].pid}
                               </span>
                             ) : (
-                              <span className="text-emerald-700 font-medium">
-                                ● Novel
-                              </span>
+                              <span className="text-emerald-700 font-medium">● Novel</span>
                             )}
                           </td>
 
                           {/* PubMed Reference */}
                           <td className="py-2.5 px-3 whitespace-nowrap font-mono tabular-nums">
-                            <a
-                              href={`https://pubmed.ncbi.nlm.nih.gov/${rel.pubmedReference.pmid}/`}
-                              target="_blank"
-                              rel="noreferrer"
-                              onClick={(e) => e.stopPropagation()}
-                              className="text-blue-600 hover:underline inline-flex items-center gap-0.5"
-                              title={rel.pubmedReference.title}
-                            >
-                              <span>PMID:{rel.pubmedReference.pmid}</span>
-                              <ExternalLink className="w-3 h-3" />
-                            </a>
+                            {rel.pubmedReference ? (
+                              <a
+                                href={`https://pubmed.ncbi.nlm.nih.gov/${rel.pubmedReference.pmid}/`}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-blue-600 hover:underline inline-flex items-center gap-0.5"
+                                title={`${rel.pubmedReference.title} (${rel.pubmedReference.matchLevel}, ${rel.pubmedReference.hitCount} hits)`}
+                              >
+                                <span>PMID:{rel.pubmedReference.pmid}</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            ) : rel.pubmedState === 'loading' ? (
+                              <span className="text-slate-500 font-sans">… searching</span>
+                            ) : rel.pubmedState === 'none' ? (
+                              <span className="text-slate-400 font-sans">none found</span>
+                            ) : rel.pubmedState === 'error' ? (
+                              <span className="text-amber-700 font-sans" title={rel.pubmedError}>⚠ error</span>
+                            ) : (
+                              <span className="text-slate-300 font-sans">—</span>
+                            )}
                           </td>
 
                           {/* Single-Click Approve / Reject Buttons */}
@@ -1167,7 +1005,9 @@ export default function App() {
                                     ? 'bg-emerald-600 text-white'
                                     : 'bg-slate-100 text-slate-700 hover:bg-emerald-600 hover:text-white'
                                 }`}
-                                title="Single-click Approve"
+                                title={canApprove(rel) ? 'Single-click Approve' : 'Both MeSH IDs must resolve to Wikidata items first'}
+                                disabled={!canApprove(rel) && rel.status !== 'approved'}
+                                style={!canApprove(rel) && rel.status !== 'approved' ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
                               >
                                 <Check className="w-3.5 h-3.5" />
                                 <span>{rel.status === 'approved' ? 'Approved' : 'Approve'}</span>
@@ -1208,6 +1048,7 @@ export default function App() {
               onDecision={handleDecision}
               onPropertyChange={handlePropertyChange}
               onRefreshPubMed={handleRefreshPubMed}
+              canApprove={selectedRelation ? canApprove(selectedRelation) : false}
             />
           </div>
         </main>
