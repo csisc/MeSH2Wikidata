@@ -42,6 +42,12 @@ export interface WikidataPropertySpec {
   domainGroups: SemanticGroup[];
   rangeGroups: SemanticGroup[];
   exampleUsage: string;
+  /** Topic bucket shown in the property table */
+  category?: string;
+  /** Structural/meta property (instance of, part of...): ranked below specific properties of equal fit */
+  generic?: boolean;
+  /** Added by the curator at runtime, not part of the curated list */
+  custom?: boolean;
 }
 
 export interface PubMedReference {
@@ -119,6 +125,8 @@ export interface DatasetInfoResponse {
     duplicateCount: number;
   };
   availableProperties: WikidataPropertySpec[];
+  /** Properties whose ID failed the live label check and are therefore not offered */
+  excludedPids: string[];
 }
 
 export interface LlmConfig {

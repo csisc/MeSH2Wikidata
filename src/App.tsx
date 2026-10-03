@@ -16,11 +16,12 @@ import {
   LlmConfig,
   MeshEntityInfo,
   ProcessedRelationRecord,
+  WikidataPropertySpec,
 } from './types';
 import { WIKIDATA_BIOMEDICAL_PROPERTIES } from './data/biomedicalOntology';
 import { classifyRuleBased, classifyWithOllama, loadConfig, saveConfig } from './lib/classifier';
 import { parseCsv, ParsedCsv, RawCsvRow } from './lib/csv';
-import { findExistingLinks, resolveMeshIds } from './lib/wikidata';
+import { fetchPropertySpec, findExistingLinks, PropertyCheck, resolveMeshIds, verifyProperties } from './lib/wikidata';
 import { findPubMedReference } from './lib/pubmed';
 import { canApprove, isExactDuplicate } from './lib/quickstatements';
 import { RelationInspector } from './components/RelationInspector';
@@ -115,6 +116,45 @@ export default function App() {
   }, []);
   const meshCache = useRef(new Map<string, MeshEntityInfo>());
 
+  // Candidate properties: the curated list minus any whose ID fails the live Wikidata label check.
+  const [propChecks, setPropChecks] = useState<PropertyCheck[]>([]);
+  const [propsReady, setPropsReady] = useState(false);
+  const [propertyWarnings, setPropertyWarnings] = useState<string[]>([]);
+  const activeProps = useMemo(() => {
+    const bad = new Set(propChecks.filter((c) => !c.ok).map((c) => c.pid));
+    return WIKIDATA_BIOMEDICAL_PROPERTIES.filter((x) => !bad.has(x.pid));
+  }, [propChecks]);
+  const excludedPids = useMemo(() => propChecks.filter((c) => !c.ok).map((c) => c.pid), [propChecks]);
+  const propsRef = useRef<WikidataPropertySpec[]>(WIKIDATA_BIOMEDICAL_PROPERTIES);
+  propsRef.current = activeProps;
+  const customProps = useRef(new Map<string, WikidataPropertySpec>());
+
+  const runPropertyCheck = useCallback(async (): Promise<PropertyCheck[]> => {
+    const res = await verifyProperties(WIKIDATA_BIOMEDICAL_PROPERTIES);
+    setPropChecks(res);
+    return res;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    runPropertyCheck()
+      .then((res) => {
+        const bad = res.filter((c) => !c.ok);
+        if (!cancelled && bad.length > 0) {
+          setPropertyWarnings([
+            `${bad.length} configured property ID(s) do not match their Wikidata label and were switched off: ${bad.map((b) => b.pid).join(', ')}. See Property Classifier.`,
+          ]);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setPropertyWarnings([`Property IDs could not be verified against Wikidata (${errMsg(e)}); using the curated list as is.`]);
+      })
+      .finally(() => !cancelled && setPropsReady(true));
+    return () => {
+      cancelled = true;
+    };
+  }, [runPropertyCheck]);
+
   const [pipeline, setPipeline] = useState<PipelineState | null>(null);
   const [pipelineErrors, setPipelineErrors] = useState<string[]>([]);
   const runRef = useRef(0);
@@ -164,7 +204,7 @@ export default function App() {
   const makeRecord = useCallback((row: RawCsvRow): ProcessedRelationRecord => {
     const subject = meshCache.current.get(row.subjectMeshId) ?? pendingEntity(row.subjectMeshId);
     const object = meshCache.current.get(row.objectMeshId) ?? pendingEntity(row.objectMeshId);
-    const prediction = classifyRuleBased(subject, object, row.pmi);
+    const prediction = classifyRuleBased(subject, object, row.pmi, propsRef.current);
     const unresolved = (e: MeshEntityInfo) => e.resolution !== 'pending' && !e.qid;
     return {
       id: keyOf(row),
@@ -251,7 +291,7 @@ export default function App() {
             const subject = meshCache.current.get(r.subjectMeshId) ?? rec.subject;
             const object = meshCache.current.get(r.objectMeshId) ?? rec.object;
             if (rec.subject === subject && rec.object === object) continue;
-            const prediction = classifyRuleBased(subject, object, rec.pmi);
+            const prediction = classifyRuleBased(subject, object, rec.pmi, propsRef.current);
             const keepProperty = rec.selectedProperty.pid !== rec.llmPrediction.recommendedProperty.pid;
             const bad = (e: MeshEntityInfo) => e.resolution !== 'pending' && !e.qid;
             copy.set(rec.id, {
@@ -312,7 +352,7 @@ export default function App() {
             setPipeline({ label: `Asking ${cfg.ollamaModel} to choose properties`, done: i, total: todo.length });
             const rec = todo[i];
             try {
-              const pred = await classifyWithOllama(cfg, rec.subject, rec.object, rec.pmi, ac.signal);
+              const pred = await classifyWithOllama(cfg, rec.subject, rec.object, rec.pmi, ac.signal, propsRef.current);
               if (stale()) return;
               patch(rec.id, (cur) => ({
                 ...cur,
@@ -361,9 +401,9 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!csvLoading && rows.length > 0) loadBatch(currentBatchIndex, rows);
+    if (!csvLoading && propsReady && rows.length > 0) loadBatch(currentBatchIndex, rows);
     return () => abortRef.current?.abort();
-  }, [currentBatchIndex, rows, csvLoading, loadBatch]);
+  }, [currentBatchIndex, rows, csvLoading, propsReady, loadBatch]);
 
   const currentBatchRelations = useMemo(() => {
     const slice = rows.slice(currentBatchIndex * MAX_BATCH_SIZE, (currentBatchIndex + 1) * MAX_BATCH_SIZE);
@@ -382,12 +422,29 @@ export default function App() {
 
   const handlePropertyChange = useCallback(
     (id: string, pid: string) => {
-      const prop = WIKIDATA_BIOMEDICAL_PROPERTIES.find((p) => p.pid === pid);
-      if (!prop) return;
-      patch(id, (item) => ({ ...item, selectedProperty: prop, updatedAt: new Date().toISOString() }));
+      patch(id, (item) => {
+        const prop =
+          propsRef.current.find((x) => x.pid === pid) ??
+          customProps.current.get(pid) ??
+          item.llmPrediction.alternatives.find((a) => a.property.pid === pid)?.property;
+        return prop ? { ...item, selectedProperty: prop, updatedAt: new Date().toISOString() } : item;
+      });
     },
     [patch]
   );
+
+  /** One-off override with any item-valued Wikidata property; throws a readable message when invalid. */
+  const handleCustomProperty = useCallback(
+    async (id: string, pid: string) => {
+      const spec = await fetchPropertySpec(pid);
+      customProps.current.set(spec.pid, spec);
+      patch(id, (item) => ({ ...item, selectedProperty: spec, updatedAt: new Date().toISOString() }));
+    },
+    [patch]
+  );
+
+  const optionsFor = (rel: ProcessedRelationRecord): WikidataPropertySpec[] =>
+    activeProps.some((x) => x.pid === rel.selectedProperty.pid) ? activeProps : [rel.selectedProperty, ...activeProps];
 
   // Manual PubMed refresh for one row, using the property currently selected.
   const handleRefreshPubMed = useCallback(
@@ -498,8 +555,9 @@ export default function App() {
       processedTotal: processedRelations.size,
       stats: { approvedCount, rejectedCount, pendingCount, duplicateCount },
       availableProperties: WIKIDATA_BIOMEDICAL_PROPERTIES,
+      excludedPids,
     };
-  }, [rows.length, parsed.skipped, csvSource, totalBatches, processedRelations]);
+  }, [rows.length, parsed.skipped, csvSource, totalBatches, processedRelations, excludedPids]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -619,6 +677,8 @@ export default function App() {
             rawCsvString={rawCsvString}
             config={config}
             onConfigChange={updateConfig}
+            propertyChecks={propChecks}
+            onVerifyProperties={runPropertyCheck}
           />
         </main>
       ) : (
@@ -686,7 +746,7 @@ export default function App() {
           </div>
 
           {/* Live pipeline status & errors */}
-          {(pipeline || pipelineErrors.length > 0 || batchCounts.unresolved > 0) && (
+          {(pipeline || pipelineErrors.length > 0 || propertyWarnings.length > 0 || batchCounts.unresolved > 0) && (
             <div className="px-6 py-2 bg-white border-b border-slate-200 space-y-1 text-xs">
               {pipeline && (
                 <p className="text-blue-700 font-medium tabular-nums">
@@ -694,7 +754,7 @@ export default function App() {
                   {pipeline.total > 1 ? ` (${pipeline.done}/${pipeline.total})` : '…'}
                 </p>
               )}
-              {pipelineErrors.map((m) => (
+              {[...propertyWarnings, ...pipelineErrors].map((m) => (
                 <p key={m} className="text-amber-800 flex items-start gap-1.5">
                   <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
                   <span>{m}</span>
@@ -907,7 +967,7 @@ export default function App() {
                               onChange={(e) => handlePropertyChange(rel.id, e.target.value)}
                               className="text-xs bg-white border border-slate-200 hover:border-slate-300 rounded px-2 py-1 text-slate-900 font-medium max-w-[215px] truncate focus:outline-none focus:ring-1 focus:ring-blue-600"
                             >
-                              {WIKIDATA_BIOMEDICAL_PROPERTIES.map((p) => (
+                              {optionsFor(rel).map((p) => (
                                 <option key={p.pid} value={p.pid}>
                                   {p.pid} ({p.label})
                                 </option>
@@ -1044,7 +1104,8 @@ export default function App() {
             {/* Right-Hand Evidence & Offline LLM Inspector */}
             <RelationInspector
               relation={selectedRelation}
-              availableProperties={WIKIDATA_BIOMEDICAL_PROPERTIES}
+              availableProperties={activeProps}
+              onCustomProperty={handleCustomProperty}
               onDecision={handleDecision}
               onPropertyChange={handlePropertyChange}
               onRefreshPubMed={handleRefreshPubMed}
