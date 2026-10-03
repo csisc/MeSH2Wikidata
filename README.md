@@ -9,9 +9,9 @@ It runs entirely in the browser and needs no server.
 | Step | How | Source |
 |---|---|---|
 | MeSH descriptor ID → Wikidata item | one SPARQL query on **P486** (MeSH descriptor ID); label, description and MeSH tree numbers (**P672**) come back with it | Wikidata Query Service |
-| Existing statements | one SPARQL query for every direct claim between the two items, in both directions, any property | Wikidata Query Service |
+| Existing statements | one SPARQL query for every non-deprecated statement between the two items, in both directions, any property, with its reference count and PubMed IDs; a relation that already exists *and* already cites the PubMed paper is not exported again | Wikidata Query Service |
 | Property suggestion | rule-based domain/range scorer (default), or a **local LLM through Ollama** that must pick from the candidate list or answer `NONE` | your machine |
-| Reference | PubMed search for papers indexed with both MeSH terms (plus a subheading hint for the chosen property), top hit by relevance | NCBI E-utilities |
+| Reference | PubMed search: papers indexed with both MeSH terms (with a subheading hint for the chosen property first), then a title/abstract fallback; the inspector says which kind of match it is | NCBI E-utilities |
 | Export | QuickStatements V1 with `S698` (PubMed ID) and `S813` (retrieved) | – |
 
 Nothing is faked: a MeSH ID with no Wikidata item (or a qualifier such as `Q000523`) is shown as unresolved and
