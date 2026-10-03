@@ -24,8 +24,15 @@ cannot be approved; failed network calls are shown as errors, never replaced by 
 * The duplicate check is derived from the *currently selected* property: changing the property updates it.
 * The "Approve novel" bulk action skips rows that are unresolved, already in Wikidata, not yet checked, or below the
   confidence threshold set under *Property Classifier*.
-* The property list lives in `src/data/biomedicalOntology.ts`. Use *Property Classifier → Check property IDs against
-  Wikidata* to confirm every ID still carries the expected label.
+* The curated list has 52 item-valued properties in seven groups (treatment & clinical, disease mechanisms, genes &
+  molecular biology, anatomy & cells, organisms, chemistry & pharmacology, general/structural). It lives in
+  `src/data/biomedicalOntology.ts`; add a property by appending one `p(...)` line.
+* At startup every ID is compared with its live Wikidata label. A mismatch or missing property is **switched off**
+  and reported in the banner and under *Property Classifier*, so a wrong ID can never reach an export.
+* For anything not in the list, type a property ID under *Other property ID* in the inspector. The app checks that it
+  exists and takes item values, and marks the row as hand-added.
+* Where the category pair cannot separate two properties (for example disease → disease: symptom, cause or subclass),
+  the rule-based scorer marks the row *ambiguous* and keeps its confidence below the bulk-approve threshold.
 
 ## Local LLM (optional)
 
