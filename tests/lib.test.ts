@@ -50,15 +50,17 @@ await t('MeSH query only embeds well-formed IDs and parses hits, ambiguity, miss
   assert.equal(m.get('Q000523')!.resolution, 'qualifier');
 });
 
-await t('existing-link query/parse keeps direction and ignores unrelated pairs', () => {
+await t('existing-link query reads statement nodes (refs, PMIDs, no deprecated) and parses direction + references', () => {
   const pairs = [{ key: 'a', subjectQid: 'Q1', objectQid: 'Q2' }];
-  assert.ok(buildLinksQuery(pairs).includes('(wd:Q1 wd:Q2)'));
+  const q = buildLinksQuery(pairs);
+  assert.ok(q.includes('(wd:Q1 wd:Q2)') && q.includes('prov:wasDerivedFrom') && q.includes('pr:P698') && q.includes('DeprecatedRank'));
+  const E = 'http://www.wikidata.org/entity/';
   const res = parseLinksBindings(pairs, [
-    { s: { value: 'http://www.wikidata.org/entity/Q1' }, o: { value: 'http://www.wikidata.org/entity/Q2' }, p: { value: 'http://www.wikidata.org/prop/direct/P2176' }, propLabel: { value: 'drug or therapy used for treatment' }, dir: { value: 'forward' } },
-    { s: { value: 'http://www.wikidata.org/entity/Q1' }, o: { value: 'http://www.wikidata.org/entity/Q2' }, p: { value: 'http://www.wikidata.org/prop/direct/P2175' }, dir: { value: 'reverse' } },
-    { s: { value: 'http://www.wikidata.org/entity/Q9' }, o: { value: 'http://www.wikidata.org/entity/Q2' }, p: { value: 'http://www.wikidata.org/prop/direct/P1' }, dir: { value: 'forward' } },
+    { s: { value: E + 'Q1' }, o: { value: E + 'Q2' }, prop: { value: E + 'P2176' }, propLabel: { value: 'drug or therapy used for treatment' }, dir: { value: 'forward' }, refs: { value: '2' }, pmids: { value: '111|222' } },
+    { s: { value: E + 'Q1' }, o: { value: E + 'Q2' }, prop: { value: E + 'P2175' }, dir: { value: 'reverse' }, refs: { value: '0' }, pmids: { value: '' } },
+    { s: { value: E + 'Q9' }, o: { value: E + 'Q2' }, prop: { value: E + 'P1' }, dir: { value: 'forward' }, refs: { value: '1' } },
   ]);
-  assert.deepEqual(res.get('a')!.map((l) => `${l.direction}:${l.pid}`), ['forward:P2176', 'reverse:P2175']);
+  assert.deepEqual(res.get('a')!.map((l) => `${l.direction}:${l.pid}:${l.referenceCount}:${l.pmids.join('+')}`), ['forward:P2176:2:111+222', 'reverse:P2175:0:']);
 });
 
 await t('rule-based classifier: disease->drug picks P2176, unknown groups are capped and flagged', () => {
@@ -119,6 +121,22 @@ await t('verifyProperties flags a label that does not match Wikidata', async () 
   assert.equal(r.find((x) => x.pid === 'P923')!.ok, false);
 });
 
+await t('verifyProperties respects the 50-ID API limit and never reads an API error as "all wrong"', async () => {
+  const sizes: number[] = [];
+  mockFetch((url) => {
+    const ids = new URL(url).searchParams.get('ids')!.split('|');
+    sizes.push(ids.length);
+    if (ids.length > 50) return { error: { code: 'toomanyvalues', info: 'Too many values supplied' } };
+    return { entities: Object.fromEntries(ids.map((id) => [id, { labels: { en: { value: WIKIDATA_BIOMEDICAL_PROPERTIES.find((p) => p.pid === id)!.label } } }])) };
+  });
+  const all = await verifyProperties(WIKIDATA_BIOMEDICAL_PROPERTIES);
+  assert.ok(WIKIDATA_BIOMEDICAL_PROPERTIES.length > 50, 'catalogue must exceed one request to exercise chunking');
+  assert.ok(sizes.length >= 2 && sizes.every((n) => n <= 50), JSON.stringify(sizes));
+  assert.ok(all.every((x) => x.ok));
+  mockFetch(() => ({ error: { code: 'x', info: 'boom' } }));
+  await assert.rejects(verifyProperties(WIKIDATA_BIOMEDICAL_PROPERTIES), /boom/);
+});
+
 await t('PubMed: relation-specific query first, falls back to co-indexed, returns null when nothing', async () => {
   const seen: string[] = [];
   mockFetch((url) => {
@@ -134,6 +152,18 @@ await t('PubMed: relation-specific query first, falls back to co-indexed, return
   assert.equal(ref!.pmid, '123');
   assert.equal(ref!.matchLevel, 'co-indexed');
   assert.equal(ref!.hitCount, 42);
+  const queries: string[] = [];
+  mockFetch((url) => {
+    if (url.includes('esearch')) {
+      const term = new URL(url).searchParams.get('term')!;
+      queries.push(term);
+      return { esearchresult: term.includes('[Title/Abstract]') ? { count: '3', idlist: ['77'] } : { count: '0', idlist: [] } };
+    }
+    return { result: { '77': { title: 'Text hit', source: 'J', pubdate: '2019' } } };
+  });
+  const viaText = await findPubMedReference({ subjectLabel: 'a', objectLabel: 'b' });
+  assert.equal(viaText!.matchLevel, 'text-mention');
+  assert.equal(queries.length, 2);
   mockFetch(() => ({ esearchresult: { count: '0', idlist: [] } }));
   assert.equal(await findPubMedReference({ subjectLabel: 'a', objectLabel: 'b' }), null);
   assert.equal(buildPubMedQuery('Leukocytes, Mononuclear (D007962)', 'B'), '"Leukocytes, Mononuclear"[MeSH Terms] AND "B"[MeSH Terms]');
@@ -230,13 +260,14 @@ await t('QuickStatements V1: needs approval + QIDs, honours reference and duplic
     base('pending', { status: 'pending' }),
     base('unresolved', { object: ent({ qid: null, resolution: 'not-found' }) }),
     base('noref', { pubmedReference: null, pubmedState: 'none' }),
-    base('dup', { wikidataVerification: { state: 'checked', existing: [{ pid: 'P2176', label: 'x', direction: 'forward' }] } }),
+    base('dup', { wikidataVerification: { state: 'checked', existing: [{ pid: 'P2176', label: 'x', direction: 'forward', referenceCount: 0, pmids: [] }] } }),
+    base('cited', { wikidataVerification: { state: 'checked', existing: [{ pid: 'P2176', label: 'x', direction: 'forward', referenceCount: 1, pmids: ['999'] }] } }),
   ];
   const d = new Date('2026-10-02T12:00:00Z');
   const strict = buildV1(recs, { requireReference: true, includeExactDuplicates: false, retrieved: d });
   assert.equal(strict, 'Q10\tP2176\tQ20\tS698\t"999"\tS813\t+2026-10-02T00:00:00Z/11');
   const loose = buildV1(recs, { requireReference: false, includeExactDuplicates: true, retrieved: d }).split('\n');
-  assert.equal(loose.length, 3);
+  assert.equal(loose.length, 3, 'duplicate without our PMID is kept; one already citing our PMID is dropped');
   assert.ok(loose.includes('Q10\tP2176\tQ20'));
   assert.ok(buildV1Url(strict).startsWith('https://quickstatements.toolforge.org/#/v1=Q10%7CP2176%7CQ20%7CS698'));
   assert.equal(buildAuditCsv(recs, { requireReference: true, includeExactDuplicates: false }).split('\n').length, 2);
