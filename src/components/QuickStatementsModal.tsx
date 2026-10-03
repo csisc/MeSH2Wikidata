@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Copy, Check, Download, ExternalLink, X } from 'lucide-react';
 import { ProcessedRelationRecord } from '../types';
+import { buildAuditCsv, buildV1, buildV1Url, ExportOptions, isExportable } from '../lib/quickstatements';
 
 interface QuickStatementsModalProps {
   isOpen: boolean;
@@ -8,204 +9,137 @@ interface QuickStatementsModalProps {
   allApprovedRelations: ProcessedRelationRecord[];
 }
 
+// Browsers and Toolforge both choke on very long URLs; above this, paste or upload the batch instead.
+const MAX_URL_CHARS = 6000;
+
 export const QuickStatementsModal: React.FC<QuickStatementsModalProps> = ({
   isOpen,
   onClose,
   allApprovedRelations,
 }) => {
-  const [format, setFormat] = useState<'v1' | 'v2'>('v1');
-  const [scope, setScope] = useState<'novel-approved' | 'approved'>('novel-approved');
+  const [requireReference, setRequireReference] = useState(true);
+  const [includeExactDuplicates, setIncludeExactDuplicates] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  const opts: ExportOptions = useMemo(
+    () => ({ requireReference, includeExactDuplicates }),
+    [requireReference, includeExactDuplicates]
+  );
+
+  const v1 = useMemo(() => buildV1(allApprovedRelations, opts), [allApprovedRelations, opts]);
+  const count = useMemo(
+    () => allApprovedRelations.filter((r) => isExportable(r, opts)).length,
+    [allApprovedRelations, opts]
+  );
+  const held = allApprovedRelations.length - count;
+  const url = useMemo(() => buildV1Url(v1), [v1]);
 
   if (!isOpen) return null;
 
-  const records = allApprovedRelations.filter((r) => {
-    if (scope === 'novel-approved') return !r.wikidataVerification.existsInWikidata;
-    return true;
-  });
-
-  const retrievedDate = '+2026-10-02T00:00:00Z/11';
-
-  // QuickStatements V1 format (Tab-separated: SubjectQID \t PropertyID \t ObjectQID \t S698 \t "PMID" \t S813 \t +YYYY-MM-DDT00:00:00Z/11)
-  const v1Lines = records.map(
-    (r) =>
-      `${r.subject.qid}\t${r.selectedProperty.pid}\t${r.object.qid}\tS698\t"${r.pubmedReference.pmid}"\tS813\t${retrievedDate}\t/* ${r.subject.label} (${r.subjectMeshId}) -> ${r.selectedProperty.label} -> ${r.object.label} (${r.objectMeshId}) | PMI=${r.pmi.toFixed(2)} */`
-  );
-
-  // QuickStatements V1 pipe-delimited URL command format for direct QuickStatements link
-  const v1PipeCommands = records
-    .map(
-      (r) =>
-        `${r.subject.qid}|${r.selectedProperty.pid}|${r.object.qid}|S698|"${r.pubmedReference.pmid}"|S813|${retrievedDate}`
-    )
-    .join('||');
-
-  // QuickStatements V2 CSV format
-  const v2CsvLines = [
-    'qid,P,value,S698,S813,#comment',
-    ...records.map(
-      (r) =>
-        `${r.subject.qid},${r.selectedProperty.pid},${r.object.qid},"""${r.pubmedReference.pmid}""",${retrievedDate},"${r.subject.label} -> ${r.object.label} (PMI ${r.pmi.toFixed(2)})"`
-    ),
-  ];
-
-  const activeText = format === 'v1' ? v1Lines.join('\n') : v2CsvLines.join('\n');
+  const download = (text: string, name: string, mime: string) => {
+    const blob = new Blob([text], { type: mime });
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(href);
+  };
 
   const handleCopy = () => {
-    if (!activeText) return;
-    navigator.clipboard.writeText(activeText);
+    if (!v1) return;
+    navigator.clipboard.writeText(v1);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDownload = () => {
-    if (!activeText) return;
-    const ext = format === 'v1' ? 'qs.txt' : 'qs_v2.csv';
-    const mime = format === 'v1' ? 'text/plain;charset=utf-8' : 'text/csv;charset=utf-8';
-    const blob = new Blob([activeText], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `wikidata_mesh_relations_${ext}`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const quickStatementsUrl = v1PipeCommands
-    ? `https://quickstatements.toolforge.org/#/v1=${encodeURIComponent(v1PipeCommands)}`
-    : 'https://quickstatements.toolforge.org/#/';
-
   return (
     <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
       <div className="bg-white border border-slate-200 rounded-lg max-w-4xl w-full shadow-xl flex flex-col max-h-[88vh]">
-        {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
           <div>
-            <h2 className="text-lg font-semibold text-slate-900">
-              Export Approved Relations to Wikidata QuickStatements
-            </h2>
+            <h2 className="text-lg font-semibold text-slate-900">Export approved relations to QuickStatements</h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Includes resolved Subject QID, Offline LLM Property PID, Object QID, PubMed ID reference (S698), and retrieved timestamp (S813).
+              QuickStatements V1 commands: subject item, property, object item, reference PubMed ID (S698) and retrieval date (S813).
+              Paste them into QuickStatements and read its preview before running the batch.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-2 text-slate-500 hover:text-slate-900 rounded-md cursor-pointer"
-            aria-label="Close export modal"
-          >
+          <button type="button" onClick={onClose} className="p-2 text-slate-500 hover:text-slate-900 rounded-md cursor-pointer" aria-label="Close export modal">
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Controls Bar */}
         <div className="px-6 py-3 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-md">
-              <button
-                type="button"
-                onClick={() => setFormat('v1')}
-                className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
-                  format === 'v1'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                QuickStatements V1 (TSV)
-              </button>
-              <button
-                type="button"
-                onClick={() => setFormat('v2')}
-                className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
-                  format === 'v2'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                QuickStatements V2 (CSV)
-              </button>
-            </div>
-
-            <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-md">
-              <button
-                type="button"
-                onClick={() => setScope('novel-approved')}
-                className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
-                  scope === 'novel-approved'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Novel Approved Only (No Duplicates)
-              </button>
-              <button
-                type="button"
-                onClick={() => setScope('approved')}
-                className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
-                  scope === 'approved'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                All Approved
-              </button>
-            </div>
+          <div className="flex flex-wrap items-center gap-5 text-xs text-slate-700">
+            <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <input type="checkbox" checked={requireReference} onChange={(e) => setRequireReference(e.target.checked)} className="rounded border-slate-300" />
+              <span>Only statements with a PubMed reference</span>
+            </label>
+            <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <input type="checkbox" checked={includeExactDuplicates} onChange={(e) => setIncludeExactDuplicates(e.target.checked)} className="rounded border-slate-300" />
+              <span>Include statements that already exist (reference only)</span>
+            </label>
           </div>
-
           <div className="text-xs font-mono tabular-nums text-slate-600">
-            Exporting {records.length} statement{records.length === 1 ? '' : 's'}
+            Exporting {count} statement{count === 1 ? '' : 's'}
+            {held > 0 ? ` · ${held} approved row(s) held back by the options above` : ''}
           </div>
         </div>
 
-        {/* Batch Code Preview */}
         <div className="p-6 flex-1 overflow-y-auto">
-          {records.length === 0 ? (
+          {count === 0 ? (
             <div className="py-12 text-center border border-dashed border-slate-300 rounded-lg p-6">
-              <p className="text-sm font-semibold text-slate-800">
-                No approved relations ready for export
-              </p>
+              <p className="text-sm font-semibold text-slate-800">No approved relations ready for export</p>
               <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                Approve one or more pending relations in the curation table using the single-click Approve button (or "Approve All Novel in Batch") to generate your QuickStatements batch.
+                Approve relations whose MeSH IDs both resolved to Wikidata items. With the default options a PubMed reference is also required and exact duplicates are skipped.
               </p>
             </div>
           ) : (
-            <pre className="p-4 bg-slate-900 text-slate-100 rounded-md text-xs font-mono leading-relaxed overflow-x-auto max-h-[360px]">
-              {activeText}
-            </pre>
+            <pre className="p-4 bg-slate-900 text-slate-100 rounded-md text-xs font-mono leading-relaxed overflow-x-auto max-h-[360px]">{v1}</pre>
           )}
         </div>
 
-        {/* Footer Actions */}
         <div className="px-6 py-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3 bg-white rounded-b-lg">
-          <a
-            href={quickStatementsUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-800 whitespace-nowrap"
-          >
-            <span>Open directly in Toolforge QuickStatements</span>
-            <ExternalLink className="w-3.5 h-3.5" />
-          </a>
+          {count > 0 && url.length <= MAX_URL_CHARS ? (
+            <a href={url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-800 whitespace-nowrap">
+              <span>Open in QuickStatements</span>
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          ) : (
+            <a href="https://quickstatements.toolforge.org/#/batch" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-800">
+              <span>{count > 0 ? 'Batch too long for a link: open QuickStatements and paste' : 'Open QuickStatements'}</span>
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          )}
 
           <div className="flex items-center gap-2.5">
             <button
               type="button"
-              onClick={handleDownload}
-              disabled={records.length === 0}
+              onClick={() => download(buildAuditCsv(allApprovedRelations, opts), 'mesh_wikidata_audit.csv', 'text/csv;charset=utf-8')}
+              disabled={count === 0}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40 whitespace-nowrap cursor-pointer"
+              title="Labels, PMI and PubMed titles for your own records (not a QuickStatements format)"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Audit CSV</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => download(v1, 'mesh_wikidata_batch.qs.txt', 'text/plain;charset=utf-8')}
+              disabled={count === 0}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-40 whitespace-nowrap cursor-pointer"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>Download Batch File</span>
+              <span>Download batch</span>
             </button>
-
             <button
               type="button"
               onClick={handleCopy}
-              disabled={records.length === 0}
+              disabled={count === 0}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap cursor-pointer"
             >
               {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copied ? 'Copied to Clipboard' : 'Copy QuickStatements Batch'}</span>
+              <span>{copied ? 'Copied' : 'Copy batch'}</span>
             </button>
           </div>
         </div>
