@@ -20,6 +20,7 @@ interface RelationInspectorProps {
   onPropertyChange: (id: string, pid: string) => void;
   onRefreshPubMed: (id: string) => Promise<void>;
   onCustomProperty: (id: string, pid: string) => Promise<void>;
+  onSelectPubmed: (id: string, pmid: string) => void;
   canApprove: boolean;
 }
 
@@ -80,6 +81,7 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
   onPropertyChange,
   onRefreshPubMed,
   onCustomProperty,
+  onSelectPubmed,
   canApprove,
 }) => {
   const [customPid, setCustomPid] = useState('');
@@ -395,14 +397,37 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
               <p className="mt-1 text-xs text-slate-600">
                 {relation.pubmedReference.authors} · <em>{relation.pubmedReference.journal}</em>
               </p>
+              {relation.pubmedReference.evidence.map((sentence, i) => (
+                <p key={i} className="mt-1.5 text-xs text-slate-800 leading-relaxed border-l-2 border-amber-300 pl-2">
+                  {sentence}
+                </p>
+              ))}
               <p className="mt-1.5 text-[11px] text-amber-800">
-                {relation.pubmedReference.matchLevel === 'relation-specific'
-                  ? 'Top-ranked paper indexed with both MeSH terms and a subheading fitting this property.'
-                  : relation.pubmedReference.matchLevel === 'co-indexed'
-                  ? 'Top-ranked paper indexed with both MeSH terms. It shows co-occurrence only: read it to confirm it supports this specific relation.'
-                  : 'No paper is indexed with both MeSH terms; this is the top-ranked paper mentioning both names in its title or abstract. Read it before using it as a reference.'}{' '}
-                ({relation.pubmedReference.hitCount.toLocaleString()} matching records)
+                {relation.pubmedReference.matchLevel === 'sentence-with-relation'
+                  ? 'One sentence names both items together with a word typical for this property.'
+                  : relation.pubmedReference.matchLevel === 'sentence'
+                  ? 'One sentence names both items, but nothing in it says which relation is meant: read it before approving.'
+                  : 'Both items occur in the title/abstract but never in the same sentence: weak evidence, read the paper.'}{' '}
+                {relation.pubmedReference.hitCount > 0 ? `(${relation.pubmedReference.hitCount.toLocaleString()} matching records)` : ''}
               </p>
+              {relation.pubmedCandidates.length > 1 && (
+                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <span className="text-slate-500">Other papers:</span>
+                  {relation.pubmedCandidates
+                    .filter((c) => c.pmid !== relation.pubmedReference!.pmid)
+                    .map((c) => (
+                      <button
+                        key={c.pmid}
+                        type="button"
+                        title={c.title}
+                        onClick={() => onSelectPubmed(relation.id, c.pmid)}
+                        className="px-1.5 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-100 font-mono cursor-pointer"
+                      >
+                        {c.pmid}
+                      </button>
+                    ))}
+                </div>
+              )}
               <div className="mt-2 pt-2 border-t border-slate-200/80 flex items-center justify-between text-[11px] text-slate-500">
                 <span className="font-mono truncate max-w-[230px]" title={relation.pubmedReference.queryUsed}>
                   Query: {relation.pubmedReference.queryUsed}
@@ -423,7 +448,7 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
               {relation.pubmedState === 'loading'
                 ? 'Searching PubMed...'
                 : relation.pubmedState === 'none'
-                ? 'No PubMed record is indexed with both MeSH terms. No reference can be attached automatically.'
+                ? 'No PubMed paper mentions both items in its title or abstract. No reference can be attached automatically.'
                 : relation.pubmedState === 'error'
                 ? `PubMed search failed: ${relation.pubmedError}`
                 : 'No search run yet (needs both MeSH IDs resolved).'}

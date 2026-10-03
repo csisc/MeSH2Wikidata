@@ -104,6 +104,11 @@ export const StorageAndLlmPanel: React.FC<StorageAndLlmPanelProps> = ({
   };
 
   const handleDownloadCsv = () => {
+    if (!rawCsvString) {
+      // the bundled file is a static asset: link to it instead of holding 25 MB in memory
+      window.open('./data/missing_rels.csv', '_blank');
+      return;
+    }
     const blob = new Blob([rawCsvString], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
