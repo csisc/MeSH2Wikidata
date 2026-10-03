@@ -11,7 +11,7 @@ import {
   Copy,
 } from 'lucide-react';
 import { MeshEntityInfo, ProcessedRelationRecord, WikidataPropertySpec } from '../types';
-import { isExactDuplicate } from '../lib/quickstatements';
+import { alreadyCitesPmid, existingExact, isExactDuplicate } from '../lib/quickstatements';
 
 interface RelationInspectorProps {
   relation: ProcessedRelationRecord | null;
@@ -334,9 +334,17 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
               </p>
             ) : isExactDuplicate(relation) ? (
               <p className="text-amber-800 bg-amber-50/70 border border-amber-200 rounded p-2.5 leading-relaxed">
-                <strong>Duplicate in Wikidata:</strong>{' '}
-                <span className="font-mono">{relation.subject.qid} → {relation.selectedProperty.pid} → {relation.object.qid}</span>{' '}
-                already exists. Exporting it only adds the PubMed reference (if the export option allows duplicates).
+                <strong>Relation already in Wikidata:</strong>{' '}
+                <span className="font-mono">{relation.subject.qid} → {relation.selectedProperty.pid} → {relation.object.qid}</span>.{' '}
+                {(existingExact(relation)?.referenceCount ?? 0) > 0 ? (
+                  <>
+                    It has {existingExact(relation)!.referenceCount} reference(s)
+                    {existingExact(relation)!.pmids.length > 0 ? ` (PubMed ${existingExact(relation)!.pmids.join(', ')})` : ''}.
+                    {alreadyCitesPmid(relation) ? ' The PubMed paper found below is already cited, so nothing needs adding.' : ' Adding the PubMed paper below would be an extra reference.'}
+                  </>
+                ) : (
+                  <>It has <strong>no reference</strong>: the PubMed paper below would be the first.</>
+                )}
               </p>
             ) : (
               <p className="text-emerald-800 bg-emerald-50/60 border border-emerald-200 rounded p-2.5 leading-relaxed">
@@ -347,7 +355,7 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
               <ul className="mt-2 space-y-1 text-slate-700">
                 {relation.wikidataVerification.existing.map((e) => (
                   <li key={`${e.direction}-${e.pid}`} className="font-mono text-[11px]">
-                    {e.direction === 'forward' ? 'subject → object' : 'object → subject'} via {e.pid} ({e.label}) already in Wikidata
+                    {e.direction === 'forward' ? 'subject → object' : 'object → subject'} via {e.pid} ({e.label}) already in Wikidata · {e.referenceCount} ref
                   </li>
                 ))}
               </ul>
@@ -390,7 +398,9 @@ export const RelationInspector: React.FC<RelationInspectorProps> = ({
               <p className="mt-1.5 text-[11px] text-amber-800">
                 {relation.pubmedReference.matchLevel === 'relation-specific'
                   ? 'Top-ranked paper indexed with both MeSH terms and a subheading fitting this property.'
-                  : 'Top-ranked paper indexed with both MeSH terms. It shows co-occurrence only: read it to confirm it supports this specific relation.'}{' '}
+                  : relation.pubmedReference.matchLevel === 'co-indexed'
+                  ? 'Top-ranked paper indexed with both MeSH terms. It shows co-occurrence only: read it to confirm it supports this specific relation.'
+                  : 'No paper is indexed with both MeSH terms; this is the top-ranked paper mentioning both names in its title or abstract. Read it before using it as a reference.'}{' '}
                 ({relation.pubmedReference.hitCount.toLocaleString()} matching records)
               </p>
               <div className="mt-2 pt-2 border-t border-slate-200/80 flex items-center justify-between text-[11px] text-slate-500">
