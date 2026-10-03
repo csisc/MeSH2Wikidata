@@ -43,6 +43,10 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+      - name: Download MeSH to Wikidata table (optional speed-up)
+        run: node scripts/build-mesh-map.mjs
+        continue-on-error: true
+
       - name: Build Web Application
         run: npm run build
 
