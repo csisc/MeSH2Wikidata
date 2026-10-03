@@ -16,6 +16,10 @@ export function cleanTerm(label: string): string {
   return label.replace(/\s*\([A-Z]\d+\)$/, '').replace(/"/g, '').trim();
 }
 
+export function buildTextQuery(subjectLabel: string, objectLabel: string): string {
+  return `"${cleanTerm(subjectLabel)}"[Title/Abstract] AND "${cleanTerm(objectLabel)}"[Title/Abstract]`;
+}
+
 export function buildPubMedQuery(subjectLabel: string, objectLabel: string, hint?: string): string {
   const base = `"${cleanTerm(subjectLabel)}"[MeSH Terms] AND "${cleanTerm(objectLabel)}"[MeSH Terms]`;
   return hint ? `${base} AND ${hint}` : base;
@@ -73,6 +77,8 @@ export async function findPubMedReference(opts: {
   const attempts: Array<{ query: string; level: PubMedReference['matchLevel'] }> = [];
   if (hint) attempts.push({ query: buildPubMedQuery(opts.subjectLabel, opts.objectLabel, hint), level: 'relation-specific' });
   attempts.push({ query: buildPubMedQuery(opts.subjectLabel, opts.objectLabel), level: 'co-indexed' });
+  // Wikidata labels sometimes differ from the MeSH heading; fall back to a plain text match.
+  attempts.push({ query: buildTextQuery(opts.subjectLabel, opts.objectLabel), level: 'text-mention' });
 
   for (const a of attempts) {
     const { pmid, count } = await searchOnce(a.query, apiKey, opts.signal);

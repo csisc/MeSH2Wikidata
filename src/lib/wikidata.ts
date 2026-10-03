@@ -136,15 +136,19 @@ export function buildLinksQuery(pairs: QidPair[]): string {
     .filter((p) => QID_RE.test(p.subjectQid) && QID_RE.test(p.objectQid))
     .map((p) => `(wd:${p.subjectQid} wd:${p.objectQid})`)
     .join(' ');
-  return `SELECT ?s ?o ?p ?propLabel ?dir WHERE {
+  // Walks the full statement nodes (not just wdt: truthy values) so that references can be counted.
+  return `SELECT ?s ?o ?prop ?propLabel ?dir (COUNT(DISTINCT ?refnode) AS ?refs) (GROUP_CONCAT(DISTINCT ?pmid; SEPARATOR="|") AS ?pmids) WHERE {
   VALUES (?s ?o) { ${values} }
-  { ?s ?p ?o . BIND("forward" AS ?dir) }
+  { ?s ?pp ?st . ?st ?ps ?o . BIND("forward" AS ?dir) }
   UNION
-  { ?o ?p ?s . BIND("reverse" AS ?dir) }
-  FILTER(STRSTARTS(STR(?p), "http://www.wikidata.org/prop/direct/"))
-  ?prop wikibase:directClaim ?p .
+  { ?o ?pp ?st . ?st ?ps ?s . BIND("reverse" AS ?dir) }
+  ?prop wikibase:claim ?pp ; wikibase:statementProperty ?ps .
+  ?st wikibase:rank ?rank .
+  FILTER(?rank != wikibase:DeprecatedRank)
+  OPTIONAL { ?st prov:wasDerivedFrom ?refnode . OPTIONAL { ?refnode pr:P698 ?pmid } }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-}`;
+}
+GROUP BY ?s ?o ?prop ?propLabel ?dir`;
 }
 
 export function parseLinksBindings(pairs: QidPair[], bindings: Binding[]): Map<string, ExistingLink[]> {
@@ -153,13 +157,19 @@ export function parseLinksBindings(pairs: QidPair[], bindings: Binding[]): Map<s
   for (const b of bindings) {
     const s = lastSegment(b.s?.value);
     const o = lastSegment(b.o?.value);
-    const pid = lastSegment(b.p?.value);
+    const pid = lastSegment(b.prop?.value);
     const key = keyOf.get(`${s}>${o}`);
     if (!key || !PID_RE.test(pid)) continue;
     const direction = b.dir?.value === 'reverse' ? 'reverse' : 'forward';
     const list = byPair.get(key)!;
     if (!list.some((l) => l.pid === pid && l.direction === direction)) {
-      list.push({ pid, label: b.propLabel?.value || pid, direction });
+      list.push({
+        pid,
+        label: b.propLabel?.value || pid,
+        direction,
+        referenceCount: parseInt(b.refs?.value ?? '0', 10) || 0,
+        pmids: (b.pmids?.value || '').split('|').filter(Boolean),
+      });
     }
   }
   return byPair;
@@ -191,19 +201,30 @@ export interface PropertyCheck {
   ok: boolean;
 }
 
+/** wbgetentities accepts at most 50 IDs per request (500 for bots). */
+const WBGETENTITIES_MAX = 50;
+
 export async function verifyProperties(
   props: WikidataPropertySpec[],
   signal?: AbortSignal
 ): Promise<PropertyCheck[]> {
   const ids = props.map((p) => p.pid).filter((p) => PID_RE.test(p));
-  const url =
-    `${WIKIDATA_API}?action=wbgetentities&format=json&origin=*&props=labels|descriptions&languages=en` +
-    `&ids=${ids.join('|')}`;
-  const res = await fetch(url, { signal });
-  if (!res.ok) throw new Error(`Wikidata API answered HTTP ${res.status}`);
-  const json = await res.json();
+  const entities: Record<string, { labels?: { en?: { value: string } }; descriptions?: { en?: { value: string } }; missing?: string }> = {};
+  for (let i = 0; i < ids.length; i += WBGETENTITIES_MAX) {
+    const chunk = ids.slice(i, i + WBGETENTITIES_MAX);
+    const url =
+      `${WIKIDATA_API}?action=wbgetentities&format=json&origin=*&props=labels|descriptions&languages=en` +
+      `&ids=${chunk.join('|')}`;
+    const res = await fetch(url, { signal });
+    if (!res.ok) throw new Error(`Wikidata API answered HTTP ${res.status}`);
+    const json = await res.json();
+    // An API-level error must never be read as "every property is wrong".
+    if (json?.error) throw new Error(`Wikidata API error: ${json.error.info ?? json.error.code}`);
+    if (!json?.entities) throw new Error('Wikidata API returned no entities');
+    Object.assign(entities, json.entities);
+  }
   return props.map((p) => {
-    const ent = json?.entities?.[p.pid];
+    const ent = entities[p.pid];
     const label: string | null = ent?.labels?.en?.value ?? null;
     const desc: string | null = ent?.descriptions?.en?.value ?? null;
     return {

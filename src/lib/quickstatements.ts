@@ -8,10 +8,21 @@ export interface ExportOptions {
   retrieved?: Date;
 }
 
-export function isExactDuplicate(r: ProcessedRelationRecord): boolean {
-  return r.wikidataVerification.existing.some(
+/** The statement subject -> selected property -> object already exists on Wikidata. */
+export function existingExact(r: ProcessedRelationRecord) {
+  return r.wikidataVerification.existing.find(
     (e) => e.direction === 'forward' && e.pid === r.selectedProperty.pid
   );
+}
+
+export function isExactDuplicate(r: ProcessedRelationRecord): boolean {
+  return !!existingExact(r);
+}
+
+/** The existing statement already carries the very PubMed reference we would add. */
+export function alreadyCitesPmid(r: ProcessedRelationRecord): boolean {
+  const ex = existingExact(r);
+  return !!ex && !!r.pubmedReference && ex.pmids.includes(r.pubmedReference.pmid);
 }
 
 export function isExportable(r: ProcessedRelationRecord, o: ExportOptions): boolean {
@@ -19,6 +30,7 @@ export function isExportable(r: ProcessedRelationRecord, o: ExportOptions): bool
   if (!r.subject.qid || !r.object.qid || r.subject.qid === r.object.qid) return false;
   if (o.requireReference && !r.pubmedReference) return false;
   if (!o.includeExactDuplicates && isExactDuplicate(r)) return false;
+  if (alreadyCitesPmid(r)) return false;
   return true;
 }
 
