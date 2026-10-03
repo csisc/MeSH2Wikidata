@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { parseCsv } from '../src/lib/csv';
+import { fetchPropertySpec, labelsMatch } from '../src/lib/wikidata';
 import { groupFromTreeNumbers } from '../src/lib/meshTree';
 import { buildMeshQuery, parseMeshBindings, buildLinksQuery, parseLinksBindings, resolveMeshIds, findExistingLinks, verifyProperties } from '../src/lib/wikidata';
-import { classifyRuleBased, parseOllamaAnswer, classifyWithOllama, normalizeOllamaBase, DEFAULT_LLM_CONFIG } from '../src/lib/classifier';
+import { classifyRuleBased, scoreProperties, OLLAMA_MAX_CANDIDATES, parseOllamaAnswer, classifyWithOllama, normalizeOllamaBase, DEFAULT_LLM_CONFIG } from '../src/lib/classifier';
 import { WIKIDATA_BIOMEDICAL_PROPERTIES } from '../src/data/biomedicalOntology';
 import { buildV1, buildV1Url, buildAuditCsv } from '../src/lib/quickstatements';
 import { findPubMedReference, buildPubMedQuery } from '../src/lib/pubmed';
@@ -148,6 +149,69 @@ await t('ollama classification uses the model answer and keeps rule-based altern
   assert.equal(p.recommendedProperty.pid, 'P2293');
   assert.equal(p.engine, 'ollama');
   assert.ok(p.alternatives.every((a) => a.property.pid !== 'P2293'));
+});
+globalThis.fetch = realFetch;
+
+await t('property catalogue: unique IDs, valid shape, inverse pairs exist, enough coverage', () => {
+  const props = WIKIDATA_BIOMEDICAL_PROPERTIES;
+  const ids = props.map((x) => x.pid);
+  assert.equal(new Set(ids).size, ids.length);
+  assert.ok(props.length >= 50, `only ${props.length} properties`);
+  for (const x of props) {
+    assert.match(x.pid, /^P\d+$/);
+    assert.ok(x.label && x.description && x.exampleUsage && x.category, x.pid);
+    assert.ok(x.domainGroups.length > 0 && x.rangeGroups.length > 0, x.pid);
+    if (x.inversePid) assert.equal(props.find((y) => y.pid === x.inversePid)?.inversePid, x.pid, `${x.pid} inverse`);
+  }
+});
+
+await t('label matching is lenient about case/punctuation but not about meaning', () => {
+  assert.ok(labelsMatch('Has part(s)', 'has part(s)'));
+  assert.ok(labelsMatch('has part', 'has part(s)'));
+  assert.ok(!labelsMatch('endorsed by', 'medical examination'));
+  assert.ok(!labelsMatch(null, 'x'));
+});
+
+await t('scorer: specific beats generic, symmetric inverses follow direction, ambiguity is capped', () => {
+  const gene = ent({ semanticGroup: 'Gene, Protein & Receptor' });
+  const dis = ent({ semanticGroup: 'Disease & Syndrome' });
+  const org = ent({ semanticGroup: 'Organism & Model' });
+  const anat = ent({ semanticGroup: 'Anatomical Structure' });
+  const top = (a: MeshEntityInfo, b: MeshEntityInfo) => scoreProperties(a, b, 3).slice(0, 3).map((x) => x.property.pid);
+  assert.equal(top(dis, gene)[0], 'P2293');
+  assert.equal(top(org, org)[0], 'P171');
+  assert.equal(top(anat, anat)[0] === 'P279' || top(anat, anat)[0] === 'P361', false, 'generic must not win over anatomy-specific');
+  const amb = classifyRuleBased(dis, dis, 3);
+  assert.ok(amb.confidence <= 0.6 && /Ambiguous/.test(amb.reasoning), `${amb.recommendedProperty.pid} ${amb.confidence}`);
+  const clear = classifyRuleBased(dis, ent({ semanticGroup: 'Pharmacologic Substance' }), 3);
+  assert.ok(clear.confidence > 0.9 && !/Ambiguous/.test(clear.reasoning));
+});
+
+await t('ollama prompt is limited to the best-fitting candidates', async () => {
+  let sent: any;
+  globalThis.fetch = (async (_u: any, init?: RequestInit) => {
+    sent = JSON.parse(String(init?.body));
+    return { ok: true, status: 200, json: async () => ({ message: { content: '{"pid":"NONE","confidence":0.1,"reason":"x"}' } }) } as Response;
+  }) as typeof fetch;
+  await classifyWithOllama({ ...DEFAULT_LLM_CONFIG, mode: 'ollama' }, ent({ semanticGroup: 'Disease & Syndrome' }), ent({ semanticGroup: 'Anatomical Structure' }), 3);
+  assert.equal(JSON.parse(sent.messages[1].content).candidates.length, OLLAMA_MAX_CANDIDATES);
+});
+
+await t('custom property lookup accepts item properties and rejects other datatypes / unknown IDs', async () => {
+  globalThis.fetch = (async (url: any) => {
+    const id = new URL(String(url)).searchParams.get('ids')!;
+    const entities: any = {
+      P1050: { datatype: 'wikibase-item', labels: { en: { value: 'medical condition' } }, descriptions: { en: { value: 'd' } } },
+      P569: { datatype: 'time', labels: { en: { value: 'date of birth' } } },
+      P9: { missing: '' },
+    };
+    return { ok: true, status: 200, json: async () => ({ entities: { [id]: entities[id] } }) } as Response;
+  }) as typeof fetch;
+  const spec = await fetchPropertySpec(' p1050 ');
+  assert.deepEqual([spec.pid, spec.label, spec.custom], ['P1050', 'medical condition', true]);
+  await assert.rejects(fetchPropertySpec('P569'), /not items/);
+  await assert.rejects(fetchPropertySpec('P9'), /does not exist/);
+  await assert.rejects(fetchPropertySpec('banana'), /such as P2176/);
 });
 globalThis.fetch = realFetch;
 
