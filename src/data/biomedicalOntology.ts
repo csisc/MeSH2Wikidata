@@ -70,7 +70,7 @@ export const WIKIDATA_BIOMEDICAL_PROPERTIES: WikidataPropertySpec[] = [
   p(DM, 'P828', 'has cause', 'Underlying cause, entity or process that brings this about', [...DIS, ...FUNC], [...DIS, ...CHEM, ...DRUG, ...ORG, ...GENE, ...FUNC], 'Cholera -> P828 -> Vibrio cholerae'),
   p(DM, 'P1542', 'has effect', 'Effect that this entity or process produces', [...CHEM, ...DRUG, ...ORG, ...GENE, ...FUNC, ...DIS], [...DIS, ...FUNC], 'Asbestos -> P1542 -> Mesothelioma'),
   p(DM, 'P5642', 'risk factor', 'Factor that increases the chance of developing this condition', DIS, [...CHEM, ...DRUG, ...ORG, ...FUNC, ...EPI, ...DIS], 'Lung Neoplasms -> P5642 -> Smoking'),
-  p(DM, 'P1060', 'disease transmission process', 'Way in which a pathogen or disease spreads', DIS, [...FUNC, ...ORG, ...EPI], 'Malaria -> P1060 -> Vector Borne Transmission'),
+  p(DM, 'P1060', 'pathogen transmission process', 'Way in which a pathogen or disease spreads', DIS, [...FUNC, ...ORG, ...EPI], 'Malaria -> P1060 -> Vector Borne Transmission'),
   p(DM, 'P2293', 'genetic association', 'Gene, protein or molecular factor associated with this phenotype or disorder', [...DIS, ...FUNC], GENE, 'Mouth Neoplasms -> P2293 -> Tumor Suppressor Proteins'),
   p(DM, 'P927', 'anatomical location', 'Anatomical structure, tissue or cell type where this condition or entity is found', [...DIS, ...FUNC, ...GENE], [...ANAT, ...CELL], 'Mouth Neoplasms -> P927 -> Epithelial Cells'),
 
@@ -107,7 +107,7 @@ export const WIKIDATA_BIOMEDICAL_PROPERTIES: WikidataPropertySpec[] = [
 
   // ---- General / structural (ranked below specific properties of equal fit) -------------
   p(ST, 'P2579', 'studied by', 'Discipline or field that studies this topic', [...DIS, ...ORG, ...GENE, ...FUNC, ...ANAT, ...CELL], EPI, 'Neoplasms -> P2579 -> Oncology', { inversePid: 'P2578' }),
-  p(ST, 'P2578', 'is the study of', 'Topic studied by this discipline or field', EPI, [...DIS, ...ORG, ...GENE, ...FUNC, ...ANAT, ...CELL], 'Cardiology -> P2578 -> Heart Diseases', { inversePid: 'P2579' }),
+  p(ST, 'P2578', 'studies', 'Topic studied by this discipline or field', EPI, [...DIS, ...ORG, ...GENE, ...FUNC, ...ANAT, ...CELL], 'Cardiology -> P2578 -> Heart Diseases', { inversePid: 'P2579' }),
   p(ST, 'P279', 'subclass of', 'This entity is a more specific kind of another', ALL, ALL, 'Mouth Neoplasms -> P279 -> Head and Neck Neoplasms', { generic: true }),
   p(ST, 'P31', 'instance of', 'This entity is an individual member of a class', ALL, ALL, 'Dacarbazine -> P31 -> Antineoplastic Agents', { generic: true }),
   p(ST, 'P361', 'part of', 'This entity is a component of a larger one', ALL, ALL, 'Hippocampus -> P361 -> Limbic System', { generic: true, inversePid: 'P527' }),
