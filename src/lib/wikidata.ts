@@ -211,7 +211,44 @@ export async function verifyProperties(
       configuredLabel: p.label,
       wikidataLabel: label,
       wikidataDescription: desc,
-      ok: !!label && label.trim().toLowerCase() === p.label.trim().toLowerCase(),
+      ok: labelsMatch(label, p.label),
     };
   });
+}
+
+const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+/** Same label, ignoring case/punctuation, or one contained in the other ("has part(s)" vs "has part"). */
+export function labelsMatch(wikidataLabel: string | null, configured: string): boolean {
+  if (!wikidataLabel) return false;
+  const a = norm(wikidataLabel);
+  const b = norm(configured);
+  return a === b || (a.length > 3 && b.length > 3 && (a.includes(b) || b.includes(a)));
+}
+
+/**
+ * Look up an arbitrary property ID for use as a one-off override. Only item-valued properties
+ * can link two MeSH items, so other datatypes are rejected.
+ */
+export async function fetchPropertySpec(pid: string, signal?: AbortSignal): Promise<WikidataPropertySpec> {
+  const id = pid.trim().toUpperCase();
+  if (!PID_RE.test(id)) throw new Error('Enter a property ID such as P2176.');
+  const url = `${WIKIDATA_API}?action=wbgetentities&format=json&origin=*&props=labels|descriptions|datatype&languages=en&ids=${id}`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`Wikidata API answered HTTP ${res.status}`);
+  const ent = (await res.json())?.entities?.[id];
+  if (!ent || ent.missing !== undefined) throw new Error(`${id} does not exist on Wikidata.`);
+  if (ent.datatype !== 'wikibase-item') {
+    throw new Error(`${id} (${ent.labels?.en?.value ?? 'no label'}) takes ${ent.datatype} values, not items, so it cannot link two MeSH items.`);
+  }
+  return {
+    pid: id,
+    label: ent.labels?.en?.value ?? id,
+    description: ent.descriptions?.en?.value ?? '',
+    domainGroups: [],
+    rangeGroups: [],
+    exampleUsage: '',
+    category: 'Added by curator',
+    custom: true,
+  };
 }

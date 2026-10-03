@@ -12,13 +12,12 @@ export const RULE_BASED_MODEL_ID = 'Rule-based domain/range scorer (no language 
  * candidate property. It is NOT a language model. It is the instant default and the
  * fallback when the optional local Ollama model is unavailable.
  */
-export function classifyRuleBased(
+export function scoreProperties(
   subject: MeshEntityInfo,
   object: MeshEntityInfo,
   pmi: number,
   properties: WikidataPropertySpec[] = WIKIDATA_BIOMEDICAL_PROPERTIES
-): LlmPrediction {
-  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+): Array<{ property: WikidataPropertySpec; score: number }> {
   const sg = subject.semanticGroup;
   const og = object.semanticGroup;
   const known = !!sg && !!og;
@@ -29,6 +28,11 @@ export function classifyRuleBased(
     const rangeMatch = !!og && prop.rangeGroups.includes(og);
     if (domainMatch && rangeMatch) score += 0.58;
     else if (domainMatch || rangeMatch) score += 0.28;
+
+    // Narrow properties beat broad ones of equal fit; structural properties (instance of, part of...) lose ties.
+    const breadth = (prop.domainGroups.length + prop.rangeGroups.length) / 24;
+    score += 0.06 * (1 - Math.min(1, breadth));
+    if (prop.generic) score -= 0.12;
 
     if (sg && og) {
       const sDis = DISEASE.includes(sg);
@@ -46,25 +50,52 @@ export function classifyRuleBased(
       if (sg === 'Environmental & Chemical' && prop.pid === 'P1542') score += 0.21;
       if (og === 'Epidemiology & Healthcare' && prop.pid === 'P2579') score += 0.18;
       if (sg === og && prop.pid === 'P279') score += 0.16;
+      if (sg === 'Anatomical Structure' && og === 'Anatomical Structure' && prop.pid === 'P361') score += 0.1;
     }
 
     const pmiBoost = Math.min(0.08, (pmi - 2.0) * 0.02);
     score += Math.max(0, pmiBoost);
     // Without both semantic groups (unresolved or unclassified MeSH ID) the fit is a guess.
-    score = Math.min(known ? 0.98 : 0.4, score);
+    score = Math.max(0, Math.min(known ? 0.98 : 0.4, score));
     return { property: prop, score: Number(score.toFixed(3)) };
   });
 
+  // Stable sort: ties keep the order of the property list (specific categories first).
   scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
+/** Top two scores closer than this are reported as ambiguous and capped below the default bulk-approve threshold. */
+export const AMBIGUITY_MARGIN = 0.04;
+export const AMBIGUOUS_CONFIDENCE_CAP = 0.6;
+
+export function classifyRuleBased(
+  subject: MeshEntityInfo,
+  object: MeshEntityInfo,
+  pmi: number,
+  properties: WikidataPropertySpec[] = WIKIDATA_BIOMEDICAL_PROPERTIES
+): LlmPrediction {
+  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const sg = subject.semanticGroup;
+  const og = object.semanticGroup;
+  const known = !!sg && !!og;
+  const scored = scoreProperties(subject, object, pmi, properties);
   const top = scored[0];
-  const reasoning = known
+  const second = scored[1];
+  const ambiguous = known && !!second && top.score - second.score < AMBIGUITY_MARGIN;
+  const confidence = ambiguous ? Math.min(top.score, AMBIGUOUS_CONFIDENCE_CAP) : top.score;
+
+  let reasoning = known
     ? `Subject "${subject.label}" [${sg}] and object "${object.label}" [${og}] (PMI ${pmi.toFixed(2)}): domain/range fit selects ${top.property.pid} (${top.property.label}) with score ${(top.score * 100).toFixed(1)}%.`
     : `At least one of the two MeSH descriptors is unresolved or has no recognised tree number, so ${top.property.pid} (${top.property.label}) is only a weak default. Choose the property manually.`;
+  if (ambiguous) {
+    reasoning += ` Ambiguous: ${second.property.pid} (${second.property.label}) fits almost equally well, because the category pair alone cannot tell them apart. Read the labels and decide.`;
+  }
 
   const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
   return {
     recommendedProperty: top.property,
-    confidence: top.score,
+    confidence,
     reasoning,
     alternatives: scored.slice(1, 4),
     modelId: RULE_BASED_MODEL_ID,
@@ -139,6 +170,8 @@ export function parseOllamaAnswer(
   return { pid: pidRaw, confidence: Number.isFinite(confidence) ? confidence : 0, reason };
 }
 
+export const OLLAMA_MAX_CANDIDATES = 15;
+
 export async function classifyWithOllama(
   cfg: LlmConfig,
   subject: MeshEntityInfo,
@@ -148,6 +181,11 @@ export async function classifyWithOllama(
   properties: WikidataPropertySpec[] = WIKIDATA_BIOMEDICAL_PROPERTIES
 ): Promise<LlmPrediction> {
   const base = classifyRuleBased(subject, object, pmi, properties);
+  // Small local models cope badly with 50+ options: offer the best-fitting ones (all, if categories are unknown).
+  const known = !!subject.semanticGroup && !!object.semanticGroup;
+  const candidatesAll = known
+    ? scoreProperties(subject, object, pmi, properties).slice(0, OLLAMA_MAX_CANDIDATES).map((x) => x.property)
+    : properties;
   const t0 = Date.now();
   const res = await fetch(`${normalizeOllamaBase(cfg.ollamaUrl)}/api/chat`, {
     method: 'POST',
@@ -158,12 +196,12 @@ export async function classifyWithOllama(
       stream: false,
       format: 'json',
       options: { temperature: 0 },
-      messages: buildOllamaMessages(subject, object, pmi, properties),
+      messages: buildOllamaMessages(subject, object, pmi, candidatesAll),
     }),
   });
   if (!res.ok) throw new Error(`Ollama answered HTTP ${res.status}`);
   const data = await res.json();
-  const answer = parseOllamaAnswer(String(data?.message?.content ?? ''), properties);
+  const answer = parseOllamaAnswer(String(data?.message?.content ?? ''), candidatesAll);
   const latencyMs = Date.now() - t0;
 
   if (!answer.pid) {
@@ -176,7 +214,7 @@ export async function classifyWithOllama(
       engine: 'ollama',
     };
   }
-  const chosen = properties.find((p) => p.pid === answer.pid)!;
+  const chosen = candidatesAll.find((p) => p.pid === answer.pid)!;
   const alternatives = [base.recommendedProperty, ...base.alternatives.map((a) => a.property)]
     .filter((p) => p.pid !== chosen.pid)
     .slice(0, 3)
